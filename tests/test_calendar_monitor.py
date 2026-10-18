@@ -300,6 +300,42 @@ class MonitorTests(unittest.TestCase):
             finally:
                 monitor.close()
 
+    def test_legacy_event_mrn_whitespace_uses_shared_normalization(self):
+        for sheet_mrn, event_mrn in (("00001\nALT00002", "00001 ALT00002"),
+                                     ("00001\r\nALT00002", "00001  ALT00002")):
+            with self.subTest(whitespace=repr(sheet_mrn)), tempfile.TemporaryDirectory() as directory:
+                monitor, sheets, calendar = prepared(directory)
+                try:
+                    target = sheets.book["sheets"][0]
+                    _, cols = headers(target)
+                    target["rows"][2][cols["病歷號"]] = cell(sheet_mrn)
+                    target["rows"][2][cols["CalendarEventId"]] = cell("legacywhitespace")
+                    calendar.events["legacywhitespace"] = {"id": "legacywhitespace", "summary": event_mrn + " | 合成甲 | Old"}
+                    self.assertTrue(monitor.run_once()["ok"])
+                    self.assertEqual(calendar.inserts, 1)  # Only the other synthetic patient is new.
+                    item = scan(sheets.book)["patients"][0]
+                    self.assertEqual(item["event_id"], "legacywhitespace")
+                    self.assertEqual(calendar.events["legacywhitespace"]["extendedProperties"]["private"]["vghksSyncId"], item["uid"])
+                    self.assertTrue(monitor.run_once()["ok"])
+                    self.assertEqual(calendar.inserts, 1)
+                finally:
+                    monitor.close()
+
+    def test_legacy_event_mrn_normalization_preserves_identity_boundaries(self):
+        for event_mrn in ("00001 ALT00003", "00001ALT00002"):
+            with self.subTest(case=event_mrn), tempfile.TemporaryDirectory() as directory:
+                monitor, sheets, calendar = prepared(directory)
+                try:
+                    target = sheets.book["sheets"][0]
+                    _, cols = headers(target)
+                    target["rows"][2][cols["病歷號"]] = cell("00001\nALT00002")
+                    target["rows"][2][cols["CalendarEventId"]] = cell("legacydifferent")
+                    calendar.events["legacydifferent"] = {"id": "legacydifferent", "summary": event_mrn + " | 合成甲 | Old"}
+                    self.assertFalse(monitor.run_once()["ok"])
+                    self.assertEqual((calendar.inserts, calendar.updates, calendar.deletes), (0, 0, 0))
+                finally:
+                    monitor.close()
+
     def test_ga_and_cancelled_presentation(self):
         sheet = monthly()
         _, cols = headers(sheet)

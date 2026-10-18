@@ -15,6 +15,7 @@ from pathlib import Path
 from google.auth.transport.requests import AuthorizedSession
 from google.oauth2 import service_account
 from vghks_sheet_core.cells import cell_at, fingerprint
+from vghks_sheet_core.common import norm
 
 from .calendar_client import CalendarClient, CalendarError
 from .calendar_sync import (
@@ -517,7 +518,7 @@ class CalendarMonitor:
                         raise ValueError("日曆事件屬於另一份刀表，未覆寫。")
                     if actual and not item["event_id"] and not private.get("vghksSyncId"):
                         raise ValueError("固定日曆 ID 已被未識別事件使用，未覆寫。")
-                    if actual and not private.get("vghksSyncId") and actual.get("summary", "").split(" | ")[0].strip() != item["mrn"]:
+                    if actual and not private.get("vghksSyncId") and norm(actual.get("summary", "").split(" | ")[0]) != norm(item["mrn"]):
                         raise ValueError("既有日曆事件的病歷號與刀表不同，請先核對綁定。")
                     if not matches(actual, expected):
                         result = calendar.update(eid, expected) if actual else calendar.insert(eid, expected)
