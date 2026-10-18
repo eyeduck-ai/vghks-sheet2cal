@@ -1,0 +1,7 @@
+{
+  "spreadsheet_id": "https://docs.google.com/spreadsheets/d/REPLACE_WITH_SPREADSHEET_ID/edit",
+  "calendar_id": "REPLACE_WITH_CALENDAR_ID",
+  "service_account_file": "/absolute/path/to/service-account.json",
+  "include_fu": true,
+  "hours": 1
+}

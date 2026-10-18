@@ -1,0 +1,6 @@
+{
+  "repository": "eyeduck-ai/vghks-bot",
+  "revision": "924c9eca556a0fcd5ad83b439f957cecccd36643",
+  "contract_version": "1.0.0",
+  "note": "Monitor engine and synthetic regression tests extracted from the upstream monitor; common parser maintained in op_spreadsheet/packages/python."
+}

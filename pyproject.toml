@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vghks-sheet2cal"
+version = "1.0.0"
+description = "Independent persistent VGHKS surgery and FU calendar monitor"
+requires-python = ">=3.11"
+dependencies = ["google-auth[requests]==2.58.0", "cryptography==50.0.1", "requests==2.34.2", "vghks-sheet-core @ git+https://github.com/eyeduck-ai/op_spreadsheet.git@bd018db1364f0634120a4f0e58e37ba6f35687d0#subdirectory=packages/python"]
+
+[project.optional-dependencies]
+dev = ["ruff==0.14.14"]
+
+[project.scripts]
+vghks-sheet2cal = "vghks_sheet2cal.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+vghks_sheet2cal = ["static/*"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+extend-exclude = [".upstream", ".runtime"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "B", "UP"]

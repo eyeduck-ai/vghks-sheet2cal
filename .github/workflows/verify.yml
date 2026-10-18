@@ -1,0 +1,56 @@
+name: Verify standalone calendar monitor
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        python: ['3.11', '3.12']
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - run: python -m pip install '.[dev]'
+      - run: ruff check src tests scripts
+      - run: python -m unittest discover -s tests -v
+      - name: Read compatible revisions
+        id: compatible
+        run: |
+          python - <<'PY'
+          import json, os, re
+          from pathlib import Path
+          config = json.loads(Path('compatibility.json').read_text())
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              for key in ('gas_revision', 'bot_revision'):
+                  value = config[key]
+                  assert re.fullmatch('[0-9a-f]{40}', value)
+                  output.write(key + '=' + value + '\n')
+          PY
+      - uses: actions/checkout@v6
+        with:
+          repository: eyeduck-ai/op_spreadsheet
+          ref: ${{ steps.compatible.outputs.gas_revision }}
+          path: .compat/gas
+          persist-credentials: false
+      - run: python -m vghks_sheet_core.verify --gas-repo .compat/gas
+      - uses: actions/checkout@v6
+        with:
+          repository: eyeduck-ai/vghks-bot
+          ref: ${{ steps.compatible.outputs.bot_revision }}
+          path: .compat/bot
+          persist-credentials: false
+      - run: python -m pip install ./.compat/bot
+      - run: python .compat/gas/tools/verify_consumer.py --bot-repo .compat/bot

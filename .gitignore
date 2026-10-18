@@ -1,0 +1,17 @@
+.venv/
+.runtime/
+.upstream/
+.local/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.ruff_cache/
+.pytest_cache/
+*.sqlite3*
+*.log
+.env
+config.json
+service-account*.json
+.compat/
