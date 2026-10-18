@@ -1,5 +1,6 @@
-"""Synthetic quota failures are distinct from auth and ambiguous mutations."""
+"""Synthetic Google transport and patch behavior without live patient data."""
 import unittest
+from copy import deepcopy
 from unittest.mock import Mock
 
 import requests
@@ -77,6 +78,52 @@ class GoogleHTTPTests(unittest.TestCase):
         self.assertEqual(failed.exception.code, "permission")
         self.assertFalse(failed.exception.retryable)
         session.request.assert_called_once()
+
+    def test_calendar_patch_converts_event_time_type_and_preserves_unrelated_fields(self):
+        all_day = {"start": {"date": "2026-10-01"}, "end": {"date": "2026-10-02"}}
+        timed = {"start": {"dateTime": "2026-10-01T08:00:00+08:00", "timeZone": "Asia/Taipei"},
+                 "end": {"dateTime": "2026-10-01T08:30:00+08:00", "timeZone": "Asia/Taipei"}}
+
+        def merge(target, patch):
+            for key, value in patch.items():
+                if value is None:
+                    target.pop(key, None)
+                elif isinstance(value, dict):
+                    merge(target.setdefault(key, {}), value)
+                else:
+                    target[key] = deepcopy(value)
+
+        for initial in (all_day, timed):
+            for expected in (all_day, timed):
+                with self.subTest(initial=list(initial["start"]), expected=list(expected["start"])):
+                    client, session, _ = self.client(CalendarClient)
+                    event = {**deepcopy(initial), "reminders": {"useDefault": False},
+                             "extendedProperties": {"private": {"unrelated": "keep"}}}
+                    request = {**deepcopy(expected), "summary": "synthetic",
+                               "extendedProperties": {"private": {"vghksSyncId": "synthetic-id"}}}
+                    original = deepcopy(request)
+
+                    def patch(method, url, *, target=event, **kwargs):
+                        self.assertEqual(method, "PATCH")
+                        self.assertTrue(url.endswith("/events/stable-id"))
+                        self.assertEqual(kwargs["params"], {"sendUpdates": "none"})
+                        candidate = deepcopy(target)
+                        merge(candidate, kwargs["json"])
+                        for field in ("start", "end"):
+                            if ("date" in candidate[field]) == ("dateTime" in candidate[field]):
+                                return response(400, "invalid")
+                        target.update(candidate)
+                        return Mock(status_code=200, ok=True, json=Mock(return_value=deepcopy(target)))
+
+                    session.request.side_effect = patch
+                    result = client.update("stable-id", request)
+                    self.assertEqual(result["start"], expected["start"])
+                    self.assertEqual(result["end"], expected["end"])
+                    self.assertEqual(result["reminders"], {"useDefault": False})
+                    self.assertEqual(result["extendedProperties"]["private"],
+                                     {"unrelated": "keep", "vghksSyncId": "synthetic-id"})
+                    self.assertEqual(request, original)
+                    session.request.assert_called_once()
 
     def test_pause_checkpoint_stops_a_pending_read_retry(self):
         client, session, _ = self.client(CalendarClient)

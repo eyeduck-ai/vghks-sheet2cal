@@ -430,7 +430,7 @@ source = { git = "https://github.com/eyeduck-ai/op_spreadsheet.git?subdirectory=
 
 [[package]]
 name = "vghks-sheet2cal"
-version = "1.0.1"
+version = "1.0.2"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },

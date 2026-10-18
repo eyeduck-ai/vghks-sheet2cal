@@ -83,7 +83,16 @@ class CalendarClient:
 
     def update(self, event_id, resource):
         # PATCH preserves unrelated Calendar fields such as reminders and attachments.
-        return self.request("PATCH", "/events/" + quote(event_id, safe=""), json=resource,
+        # Nested fields also retain omitted values. Explicitly clear the other
+        # time representation when converting an all-day event to/from timed.
+        payload = dict(resource)
+        for field in ("start", "end"):
+            when = resource.get(field, {})
+            if "dateTime" in when:
+                payload[field] = {**when, "date": None}
+            elif "date" in when:
+                payload[field] = {**when, "dateTime": None, "timeZone": None}
+        return self.request("PATCH", "/events/" + quote(event_id, safe=""), json=payload,
                             params={"sendUpdates": "none"})
 
     def delete(self, event_id):
