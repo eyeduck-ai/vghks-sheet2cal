@@ -13,7 +13,7 @@ function paint(data) {
   byId("success").textContent = data.last_success || "尚未成功同步";
   byId("duration").textContent = data.duration_seconds === undefined ? "—" : data.duration_seconds + " 秒";
   byId("failures").textContent = String(data.consecutive_failures || 0);
-  byId("scope").textContent = `${data.scope_from} 起（台北時間），過去事件保留`;
+  byId("scope").textContent = `${data.scope_from} 起（台北時間），依刀表目前日期；過去改期沿用原事件`;
   byId("host").textContent = ({registered: "已登記本機 · 單一主機同步", conflict: "主機登記衝突 · 已停止同步", unregistered: "尚未登記"})[data.host_state] || "待核對";
   byId("email").textContent = data.email || "尚未匯入"; byId("directory").textContent = data.data_dir;
   if (!dirty) { byId("spreadsheet").value = data.spreadsheet_id; byId("calendar").value = data.calendar_id; byId("hours").value = data.hours; byId("fu").checked = data.include_fu; byId("enabled").checked = data.enabled; }

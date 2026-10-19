@@ -9,7 +9,7 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from google.auth.transport.requests import AuthorizedSession
@@ -27,6 +27,7 @@ from .calendar_sync import (
     matches,
     resource,
     scan,
+    schedule_in_calendar_range,
 )
 from .google_sheets import GoogleSettings, SheetError, SheetsClient, spreadsheet_id
 from .host_registration import current_host_id
@@ -221,7 +222,7 @@ class CalendarMonitor:
                        and e.get("status") != "deleted" and not e.get("frozen_past")
                        and in_calendar_range(e.get("resource"), self.today())]
         new_without_id = any(not p["uid"] for p in before["patients"]
-                             if not p["date"] or date.fromisoformat(p["date"]) >= self.today())
+                             if not p["date"] or schedule_in_calendar_range(p, self.today()))
         if missing_old and new_without_id:
             raise ValueError("同時發現原排程消失與未識別病人列，疑似只搬移可見欄位；請保留原事件並核對 ID。")
         plan = plan_identity_setup(book, include_archives=True)
@@ -231,7 +232,7 @@ class CalendarMonitor:
         if expected["issues"]:
             raise ValueError("；".join(expected["issues"][:8]))
         if missing_old and any(p["uid"] not in before["identities"] for p in expected["patients"]
-                               if not p["date"] or date.fromisoformat(p["date"]) >= self.today()):
+                               if not p["date"] or schedule_in_calendar_range(p, self.today())):
             raise ValueError("舊排程識別消失且有新識別待配置，請核對是否僅搬移可見欄位；未變更刀表或日曆。")
         self._validate_bindings(plan["book"], expected)
         requests_ = plan["requests"]
@@ -268,8 +269,7 @@ class CalendarMonitor:
         if header_ids & bound_ids:
             raise ValueError("已綁定患者的排程 ID 變成刀日標題，請核對列類型與識別；未變更刀表或日曆。")
         for item in snapshot["patients"]:
-            if (item["uid"] in historical_ids
-                    or item["date"] and date.fromisoformat(item["date"]) < self.today()):
+            if item["date"] and not schedule_in_calendar_range(item, self.today()):
                 continue
             self._binding(item, self.store.get("event", item["uid"]), config)
             state = shared["states"].get(item["uid"], {})
@@ -479,13 +479,10 @@ class CalendarMonitor:
                 bindings = []
                 for item in snapshot["patients"]:
                     self._checkpoint()
-                    if item["date"] and date.fromisoformat(item["date"]) < self.today():
+                    if item["date"] and not schedule_in_calendar_range(item, self.today()):
                         past_skipped += 1
                         continue
                     old = self.store.get("event", item["uid"])
-                    if old and (old.get("frozen_past") or not in_calendar_range(old.get("resource"), self.today())):
-                        protected_past += 1
-                        continue
                     eid = self._binding(item, old, config)
                     expected = resource(item, config["spreadsheet_id"])
                     if expected is None:
@@ -499,11 +496,6 @@ class CalendarMonitor:
                         pending["legacy_event_id"] = old["legacy_event_id"]
                     self.store.save("event", item["uid"], pending)
                     actual = calendar.get(eid)
-                    if actual and not in_calendar_range(actual, self.today()):
-                        self.store.save("event", item["uid"], {**pending, "resource": actual,
-                            "status": "historical", "frozen_past": True})
-                        protected_past += 1
-                        continue
                     if "@" in eid and not actual:
                         raise ValueError("刀表的舊 iCalUID 查無事件，請人工核對；未以舊格式建立另一事件。")
                     if actual and "@" in eid:
@@ -521,8 +513,7 @@ class CalendarMonitor:
                     if actual and not private.get("vghksSyncId") and norm(actual.get("summary", "").split(" | ")[0]) != norm(item["mrn"]):
                         raise ValueError("既有日曆事件的病歷號與刀表不同，請先核對綁定。")
                     if not matches(actual, expected):
-                        if (not in_calendar_range(expected, self.today())
-                                or actual and not in_calendar_range(actual, self.today())):
+                        if not in_calendar_range(expected, self.today()):
                             past_skipped += 1
                             continue
                         self._assert_owner(sheets)
@@ -583,7 +574,7 @@ class CalendarMonitor:
             if past_skipped:
                 result["message"] += f"略過過去排程 {past_skipped} 筆。"
             if protected_past:
-                result["message"] += f"保留已綁定過去或日期不明事件 {protected_past} 筆；新手術請另建排程列。"
+                result["message"] += f"保留已無排程且已過去或日期不明的事件 {protected_past} 筆。"
             self._status(**{k: result[k] for k in ("updated", "deleted", "message")}, issues=[])
             self.last_scan_ok = True
         except Exception as exc:
