@@ -6,7 +6,9 @@
 
 ## 同步範圍
 
-每輪掃描所有受支援的 `YYYYMM` 月份與 FU／All，**包含過去與未來日期**，不是只處理今天以後。刀日標題不建立事件，無日期 FU 不建事件；年度封存的 ID 用於保護既有事件，不由封存列建立新事件。手填患者院區不會改變刀日的有效院區。
+只同步 **Asia/Taipei 今天起**的月份排程與 FU／All；今天包含整天。過去日曆事件不查詢、更新或刪除，既有綁定保留。刀日與無日期 FU 不建事件；手填患者院區不改變刀日的有效院區。
+
+刀表仍完整讀取受支援月份、FU／All 與封存的排程 ID，避免把搬列或封存誤判成刪除；不依月份名稱略過分頁。已成為過去的排程保持原樣，需要安排新手術時請建立新的排程列。
 
 ## 安裝與常駐部署
 
@@ -44,7 +46,7 @@ bash scripts/deploy.sh
 .runtime/service-venv/bin/vghks-sheet2cal status
 ```
 
-`check` 唯讀檢查 Google 連線、刀表格式與識別準備計畫。`prepare` 會維護必要技術欄、核對既有綁定並登記此主機，完成後仍停用；`enable` 才開始同步。若已有其他主機登記，先停止舊主機，再明確執行 `prepare --takeover`。請保留既有兩個 ID，不用姓名或列號推測綁定。
+`check` 唯讀檢查 Google 連線、刀表格式與識別準備計畫。`prepare` 會維護必要技術欄、核對既有綁定並登記此主機，完成後仍停用；`enable` 才開始同步。每份刀表只登記一台主機，其他主機不可覆寫登記。請保留既有兩個 ID，不用姓名或列號推測綁定。
 
 也可執行 `.runtime/service-venv/bin/vghks-sheet2cal open-ui`，在本機狀態頁匯入 JSON、檢查、準備及啟用。入口 token 每次服務啟動都會更換。
 
@@ -65,9 +67,15 @@ systemctl --user restart vghks-sheet2cal.service
 
 更新程式後再次執行 `bash scripts/deploy.sh`。更新不重建狀態資料庫；備份及搬移請保留完整狀態目錄，並在複製前停止服務。尚未完成的操作不能僅從刀表重建。
 
+## 單一主機防護
+
+刀表用固定唯一的 DOCUMENT metadata ID 登記監控識別、刀表、日曆與本機指紋；同時登記只會有一台成功。指紋由 Linux machine-id 與使用者識別雜湊產生，雲端不保存原始 machine-id。複製資料庫到另一台電腦也無法沿用登記。
+
+每輪同步及每次寫入前核對登記；不符合時停用同步並在網頁顯示衝突。同機另有資料目錄鎖與刀表跨程序鎖。登記不因離線或逾時自動轉移，重新啟動同一服務可直接恢復。更換實體主機屬管理員維護，須先停止所有監控、備份並核對登記後重新配置。
+
 ## 共用規格與相容性
 
-契約版本 **1.1.0**。正式來源位於 [op_spreadsheet 的刀表契約](https://github.com/eyeduck-ai/op_spreadsheet/tree/master/contracts)，Python 共用套件位於同 repo 的 `packages/python`。本專案依賴固定的完整 Git commit；`compatibility.json` 記錄已驗證的搭配版本。一般更新不會在背景下載規格。
+契約版本 **1.2.0**。正式來源位於 [op_spreadsheet 的刀表契約](https://github.com/eyeduck-ai/op_spreadsheet/tree/master/contracts)，Python 共用套件位於同 repo 的 `packages/python`。本專案依賴固定的完整 Git commit；`compatibility.json` 記錄已驗證的搭配版本。一般更新不會在背景下載規格。
 
 主程式與此監控使用同一份 `vghks-sheet-core` 欄位解析、永久識別、共享基準與日曆呈現。GAS 使用生成的欄位定義，並以真實 GAS 匯出案例驗證解析及操作語意。更新步驟見該 repo 的 `docs/SHEET_CONTRACT.md`。
 
@@ -82,7 +90,7 @@ uv run --locked python -m vghks_sheet_core.verify
 
 測試只使用合成資料與記憶體 Google 用戶端，涵蓋 FU、改期、事件 ID、重啟續接、刪除確認、API 重試、封存互斥、跨程序鎖、loopback 驗證與 SIGTERM 停止。CI 另取得固定 GAS source，執行真實匯出器，核對共用核心及指定主程式版本。
 
-`UPSTREAM.json` 記錄拆分來源。主程式 repo 只提供 VGHKS-bot.exe；監控在此 repo 獨立維護、發布及部署。同一刀表只啟用一個監控。
+`UPSTREAM.json` 記錄拆分來源。主程式 repo 只提供 VGHKS-bot.exe；監控在此 repo 獨立維護、發布及部署。每份刀表只允許一台主機同步。
 
 ## 獨立發布
 

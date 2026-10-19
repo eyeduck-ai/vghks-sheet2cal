@@ -75,8 +75,7 @@ def main(argv=None):
     server.add_argument("--port", type=int, default=8765)
     configure = commands.add_parser("configure", help="從本機 JSON 匯入連線設定，保持停用")
     configure.add_argument("--file", type=Path, required=True)
-    prepare = commands.add_parser("prepare", help="檢查並準備系統欄與主機登記")
-    prepare.add_argument("--takeover", action="store_true")
+    commands.add_parser("prepare", help="檢查並準備系統欄與主機登記")
     for name in ("enable", "pause", "run-once", "status", "open-ui", "check"):
         commands.add_parser(name)
     test = commands.add_parser("self-test", help="僅使用合成資料，無 Google 連線")
@@ -105,7 +104,7 @@ def main(argv=None):
             values.update(key=json.loads(keyfile.read_text(encoding="utf-8")), enabled=False)
             result = control(directory, "/api/config", values)
         elif args.command == "prepare":
-            result = control(directory, "/api/prepare", {"takeover": args.takeover})
+            result = control(directory, "/api/prepare", {})
         elif args.command == "enable":
             result = control(directory, "/api/config", {"enabled": True})
         elif args.command == "pause":

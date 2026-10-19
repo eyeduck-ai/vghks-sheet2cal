@@ -4,6 +4,7 @@ import json
 import tempfile
 import threading
 import unittest
+from datetime import date
 from pathlib import Path
 from unittest.mock import patch
 
@@ -39,7 +40,7 @@ class MonitorTests(unittest.TestCase):
                 finally:
                     monitor.close()
 
-    def test_past_and_future_months_are_reconciled_without_a_date_cutoff(self):
+    def test_past_months_are_skipped_and_future_months_are_reconciled(self):
         tabs = []
         for sid, year in ((1, 2000), (2, 2099)):
             tab = monthly(f"{year}01", sid)
@@ -53,8 +54,8 @@ class MonitorTests(unittest.TestCase):
             monitor, _, calendar = prepared(directory, workbook(*tabs))
             try:
                 self.assertTrue(monitor.run_once()["ok"])
-                self.assertEqual(calendar.inserts, 2)
-                self.assertEqual({event["start"]["dateTime"][:4] for event in calendar.events.values()}, {"2000", "2099"})
+                self.assertEqual(calendar.inserts, 1)
+                self.assertEqual({event["start"]["dateTime"][:4] for event in calendar.events.values()}, {"2099"})
             finally:
                 monitor.close()
 
@@ -205,7 +206,8 @@ class MonitorTests(unittest.TestCase):
         state = copy.deepcopy(book["sheets"][-1])
         with tempfile.TemporaryDirectory() as directory:
             sheets, calendar = MemorySheets(book), MemoryCalendar()
-            monitor = CalendarMonitor(directory, clients=lambda _: (sheets, calendar), background=False)
+            monitor = CalendarMonitor(directory, clients=lambda _: (sheets, calendar), background=False,
+                                      today=lambda: date(2026, 10, 1))
             try:
                 monitor.configure({"spreadsheet_id": "synthetic-spreadsheet-00000000000", "calendar_id": "synthetic-calendar"})
                 with self.assertRaisesRegex(ValueError, "原病歷號綁定不符"):
@@ -253,7 +255,8 @@ class MonitorTests(unittest.TestCase):
             self.assertEqual(calendar.inserts, 1)
             monitor.close()
             from vghks_sheet2cal.calendar_monitor import CalendarMonitor
-            monitor = CalendarMonitor(directory, clients=lambda _: (sheets, calendar), background=False)
+            monitor = CalendarMonitor(directory, clients=lambda _: (sheets, calendar), background=False,
+                                      today=lambda: date(2026, 10, 1))
             try:
                 self.assertTrue(monitor.run_once()["ok"])
                 self.assertEqual(calendar.inserts, 2)
@@ -337,7 +340,8 @@ class MonitorTests(unittest.TestCase):
                 target = sheets.book["sheets"][0]
                 _, cols = headers(target)
                 target["rows"][2][cols["CalendarEventId"]] = cell("legacy@google.com")
-                calendar.events["legacyid"] = {"id": "legacyid", "iCalUID": "legacy@google.com", "summary": "00001 | 合成甲 | Old"}
+                calendar.events["legacyid"] = {"id": "legacyid", "iCalUID": "legacy@google.com",
+                    "start": {"date": "2026-10-12"}, "summary": "00001 | 合成甲 | Old"}
                 self.assertTrue(monitor.run_once()["ok"])
                 self.assertEqual(calendar.inserts, 1)
                 self.assertEqual(scan(sheets.book)["patients"][0]["event_id"], "legacyid")
@@ -355,7 +359,8 @@ class MonitorTests(unittest.TestCase):
                     _, cols = headers(target)
                     target["rows"][2][cols["病歷號"]] = cell(sheet_mrn)
                     target["rows"][2][cols["CalendarEventId"]] = cell("legacywhitespace")
-                    calendar.events["legacywhitespace"] = {"id": "legacywhitespace", "summary": event_mrn + " | 合成甲 | Old"}
+                    calendar.events["legacywhitespace"] = {"id": "legacywhitespace",
+                        "start": {"date": "2026-10-12"}, "summary": event_mrn + " | 合成甲 | Old"}
                     self.assertTrue(monitor.run_once()["ok"])
                     self.assertEqual(calendar.inserts, 1)  # Only the other synthetic patient is new.
                     item = scan(sheets.book)["patients"][0]
@@ -375,7 +380,8 @@ class MonitorTests(unittest.TestCase):
                     _, cols = headers(target)
                     target["rows"][2][cols["病歷號"]] = cell("00001\nALT00002")
                     target["rows"][2][cols["CalendarEventId"]] = cell("legacydifferent")
-                    calendar.events["legacydifferent"] = {"id": "legacydifferent", "summary": event_mrn + " | 合成甲 | Old"}
+                    calendar.events["legacydifferent"] = {"id": "legacydifferent",
+                        "start": {"date": "2026-10-12"}, "summary": event_mrn + " | 合成甲 | Old"}
                     self.assertFalse(monitor.run_once()["ok"])
                     self.assertEqual((calendar.inserts, calendar.updates, calendar.deletes), (0, 0, 0))
                 finally:

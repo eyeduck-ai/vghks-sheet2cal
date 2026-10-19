@@ -1,7 +1,7 @@
 {
-  "contract_version": "1.1.0",
+  "contract_version": "1.2.0",
   "gas_repository": "eyeduck-ai/op_spreadsheet",
-  "gas_revision": "3fc44ad3685f382c2930f91d696eb965bf5db4dd",
+  "gas_revision": "e37925315fb78d091f7df8e981e8cc56e524afc2",
   "bot_repository": "eyeduck-ai/vghks-bot",
-  "bot_revision": "8f4ba058dfc070e09806ee4a69580534d3ed319f"
+  "bot_revision": "bc456d92c56eeb9ec51dda1728ce9ae0ac603bfa"
 }

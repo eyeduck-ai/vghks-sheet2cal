@@ -9,7 +9,7 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from google.auth.transport.requests import AuthorizedSession
@@ -20,13 +20,16 @@ from vghks_sheet_core.common import norm
 from .calendar_client import CalendarClient, CalendarError
 from .calendar_sync import (
     OWNER_KEY,
+    OWNER_METADATA_ID,
     digest,
     event_id,
+    in_calendar_range,
     matches,
     resource,
     scan,
 )
 from .google_sheets import GoogleSettings, SheetError, SheetsClient, spreadsheet_id
+from .host_registration import current_host_id
 from .locking import lock_file
 from .portable_credentials import seal, unseal
 from .settings import TAIPEI, timestamp
@@ -108,21 +111,29 @@ class MonitorStore:
 def metadata_owner(book):
     owners = [m for m in book.get("developerMetadata", []) if m.get("metadataKey") == OWNER_KEY]
     if len(owners) > 1:
-        raise ValueError("刀表有重複監控主機登記，請先核對。")
+        raise CalendarError("刀表有重複監控主機登記，已停止同步。", code="host_conflict")
     if not owners:
         return None, None
+    if owners[0].get("metadataId") != OWNER_METADATA_ID:
+        raise CalendarError("刀表的主機登記需由管理員更新，已停止同步。", code="host_conflict")
     try:
         return owners[0], json.loads(owners[0]["metadataValue"])
     except (ValueError, KeyError, TypeError) as exc:
-        raise ValueError("監控主機登記格式無法辨識，未變更設定。") from exc
+        raise CalendarError("監控主機登記格式無法辨識，已停止同步。", code="host_conflict") from exc
 
 
-def owner_matches(owner, config):
-    return owner == {k: config[k] for k in ("worker_id", "spreadsheet_id", "calendar_id")}
+def registration(config, host_id):
+    return {**{k: config[k] for k in ("worker_id", "spreadsheet_id", "calendar_id")}, "host_id": host_id}
+
+
+def owner_matches(owner, config, host_id=None):
+    return owner == registration(config, host_id or current_host_id())
 
 
 class CalendarMonitor:
-    def __init__(self, directory, *, clients=None, background=True):
+    def __init__(self, directory, *, clients=None, background=True, today=None, host_id=None):
+        self.host_id = host_id or current_host_id()
+        self.today = today or (lambda: datetime.now(TAIPEI).date())
         self.store = MonitorStore(directory)
         self.clients_factory = clients
         self.stop = threading.Event()
@@ -144,6 +155,7 @@ class CalendarMonitor:
         with self.state_lock:
             return {**self.store.get("config", "settings"), **self.status,
                     "configured": self.store.configured(), "data_dir": str(self.store.directory),
+                    "scope_from": self.today().isoformat(),
                     "worker_alive": self.thread.is_alive(), "platform": sys.platform, "history": self.store.recent("history")}
 
     def configure(self, values):
@@ -205,8 +217,11 @@ class CalendarMonitor:
 
         assert_archive_available(book)
         before = scan(book)
-        missing_old = [e for e in self.store.all("event") if e["uid"] not in before["identities"] and e.get("status") != "deleted"]
-        new_without_id = any(not p["uid"] for p in before["patients"])
+        missing_old = [e for e in self.store.all("event") if e["uid"] not in before["identities"]
+                       and e.get("status") != "deleted" and not e.get("frozen_past")
+                       and in_calendar_range(e.get("resource"), self.today())]
+        new_without_id = any(not p["uid"] for p in before["patients"]
+                             if not p["date"] or date.fromisoformat(p["date"]) >= self.today())
         if missing_old and new_without_id:
             raise ValueError("同時發現原排程消失與未識別病人列，疑似只搬移可見欄位；請保留原事件並核對 ID。")
         plan = plan_identity_setup(book, include_archives=True)
@@ -215,7 +230,8 @@ class CalendarMonitor:
         expected = scan(plan["book"])
         if expected["issues"]:
             raise ValueError("；".join(expected["issues"][:8]))
-        if missing_old and any(p["uid"] not in before["identities"] for p in expected["patients"]):
+        if missing_old and any(p["uid"] not in before["identities"] for p in expected["patients"]
+                               if not p["date"] or date.fromisoformat(p["date"]) >= self.today()):
             raise ValueError("舊排程識別消失且有新識別待配置，請核對是否僅搬移可見欄位；未變更刀表或日曆。")
         self._validate_bindings(plan["book"], expected)
         requests_ = plan["requests"]
@@ -224,6 +240,7 @@ class CalendarMonitor:
         fresh = self._read_monitor(sheets)
         if fingerprint(fresh) != fingerprint(book):
             raise ValueError("刀表在準備期間有變動，請重新執行；未寫入。")
+        self._assert_owner(sheets)
         sheets.write(requests_)
         result = self._read_monitor(sheets)
         actual = scan(result)
@@ -243,11 +260,17 @@ class CalendarMonitor:
         config = self.store.get("config", "settings")
         patient_ids = {item["uid"] for item in snapshot["patients"]}
         header_ids = snapshot["identities"] - patient_ids - snapshot["archive_ids"]
+        historical_ids = {old["uid"] for old in self.store.all("event")
+                          if old.get("frozen_past") or not in_calendar_range(old.get("resource"), self.today())}
         bound_ids = {old["uid"] for old in self.store.all("event") if old.get("status") != "deleted"}
         bound_ids.update(uid for uid, state in shared["states"].items() if state.get("mrn_hash"))
+        bound_ids -= historical_ids
         if header_ids & bound_ids:
             raise ValueError("已綁定患者的排程 ID 變成刀日標題，請核對列類型與識別；未變更刀表或日曆。")
         for item in snapshot["patients"]:
+            if (item["uid"] in historical_ids
+                    or item["date"] and date.fromisoformat(item["date"]) < self.today()):
+                continue
             self._binding(item, self.store.get("event", item["uid"]), config)
             state = shared["states"].get(item["uid"], {})
             bound_mrn = state.get("mrn_hash") or state.get("fields", {}).get("mrn")
@@ -269,7 +292,19 @@ class CalendarMonitor:
         if self.stop.is_set() or self.pause_epoch != self.active_epoch:
             raise CalendarError("已暫停同步，未完成操作已保留，恢復後會先核對原事件。", code="paused")
 
-    def prepare(self, takeover=False):
+    def _require_owner(self, book, config):
+        _, owner = metadata_owner(book)
+        matched = owner_matches(owner, config, self.host_id)
+        self._status(host_state="registered" if matched else "conflict" if owner else "unregistered",
+                     host_check_at=timestamp())
+        if not matched:
+            raise CalendarError("刀表已由另一個監控實例或主機登記，本機已停止同步。", code="host_conflict")
+
+    def _assert_owner(self, sheets):
+        reader = getattr(sheets, "read_metadata", None)
+        self._require_owner(reader() if reader else self._read_monitor(sheets), self.store.get("config", "settings"))
+
+    def prepare(self):
         if not self.busy.acquire(blocking=False):
             raise ValueError("同步正在執行。")
         try:
@@ -283,23 +318,31 @@ class CalendarMonitor:
                 from .sheet_archive_lock import assert_archive_available
 
                 assert_archive_available(book)
-                metadata, owner = metadata_owner(book)
-                if owner and not owner_matches(owner, config) and not takeover:
-                    raise ValueError("刀表已登記其他監控主機。停止舊主機後，明確選擇接替主機再準備。")
+                _, owner = metadata_owner(book)
+                from .sheet_identity import plan_identity_setup
+
+                preview = plan_identity_setup(book, include_archives=True)
+                if preview["issues"]:
+                    raise ValueError("刀表格式或識別需核對，尚未登記主機。")
+                self._validate_bindings(preview["book"], scan(preview["book"]))
+                if owner:
+                    self._require_owner(book, config)
+                else:
+                    # The fixed spreadsheet-scoped ID makes concurrent claims
+                    # atomic: at most one first-time registration can succeed.
+                    try:
+                        sheets.write([{"createDeveloperMetadata": {"developerMetadata": {
+                            "metadataId": OWNER_METADATA_ID, "metadataKey": OWNER_KEY,
+                            "metadataValue": json.dumps(registration(config, self.host_id), sort_keys=True),
+                            "visibility": "DOCUMENT", "location": {"spreadsheet": True}}}}])
+                    except SheetError:
+                        self._assert_owner(sheets)
+                    self._assert_owner(sheets)
+                    book = self._read_monitor(sheets)
                 book = self._migrate(sheets, book)
                 if scan(book)["issues"]:
                     raise ValueError("；".join(scan(book)["issues"][:8]))
-                expected_owner = {k: config[k] for k in ("worker_id", "spreadsheet_id", "calendar_id")}
-                owner_value = json.dumps(expected_owner, sort_keys=True)
-                request = ({"updateDeveloperMetadata": {"dataFilters": [{"developerMetadataLookup": {"metadataId": metadata["metadataId"]}}],
-                    "developerMetadata": {"metadataValue": owner_value}, "fields": "metadataValue"}} if metadata else
-                    {"createDeveloperMetadata": {"developerMetadata": {"metadataKey": OWNER_KEY, "metadataValue": owner_value,
-                        "visibility": "DOCUMENT", "location": {"spreadsheet": True}}}})
-                sheets.write([request])
-                reader = getattr(sheets, "read_metadata", None)
-                _, verified_owner = metadata_owner(reader() if reader else self._read_monitor(sheets))
-                if not owner_matches(verified_owner, config):
-                    raise ValueError("主機登記回讀不一致，監控保持停用。")
+                self._assert_owner(sheets)
             config["setup_done"] = True
             self.store.save("config", "settings", config)
             self._status(message="準備完成。啟用後每小時同步；目前仍停用。", issues=[])
@@ -333,14 +376,20 @@ class CalendarMonitor:
                 book = self._read_monitor(sheets)
                 assert_archive_available(book)
                 _, owner = metadata_owner(book)
+                matched = owner_matches(owner, config, self.host_id)
+                self._status(host_state="registered" if matched else "conflict" if owner else "unregistered",
+                             host_check_at=timestamp())
                 plan = plan_identity_setup(book, include_archives=True)
                 snapshot = scan(plan["book"], config["include_fu"])
-                return {"ok": not plan["issues"] and not snapshot["issues"],
+                today = self.today().isoformat()
+                return {"ok": not plan["issues"] and not snapshot["issues"] and (not owner or matched),
                         "issues": plan["issues"] + snapshot["issues"],
                         "planned_technical_requests": len(plan["requests"]),
                         "monthly_rows": sum(p["kind"] == "MONTHLY" for p in snapshot["patients"]),
                         "fu_rows": sum(p["kind"] == "FU" for p in snapshot["patients"]),
-                        "owner_registered": bool(owner), "owner_matches": owner_matches(owner, config),
+                        "scope_from": today,
+                        "eligible_rows": sum(bool(p["date"]) and p["date"] >= today for p in snapshot["patients"]),
+                        "owner_registered": bool(owner), "owner_matches": matched,
                         "calendar_readable": True}
         finally:
             self.busy.release()
@@ -386,6 +435,7 @@ class CalendarMonitor:
                     "endRowIndex": target["row"] + 1, "startColumnIndex": col, "endColumnIndex": col + 1},
                     "rows": [{"values": [{"userEnteredValue": {"stringValue": eid}}]}], "fields": "userEnteredValue"}})
             if requests_:
+                self._assert_owner(sheets)
                 sheets.write(requests_)
             verified = scan(self._read_monitor(sheets))
             indexed = {p["uid"]: p for p in verified["patients"]}
@@ -398,7 +448,7 @@ class CalendarMonitor:
             epoch = self.pause_epoch
         if not self.busy.acquire(blocking=False):
             return {"ok": False, "busy": True}
-        updated = deleted = 0
+        updated = deleted = past_skipped = protected_past = 0
         now = timestamp()
         started = time.monotonic()
         self.active_epoch = epoch
@@ -415,9 +465,7 @@ class CalendarMonitor:
                     if hasattr(client, "http"):
                         client.http.checkpoint = self._checkpoint
                 book = self._read_monitor(sheets)
-                _, owner = metadata_owner(book)
-                if not owner_matches(owner, config):
-                    raise ValueError("這台主機不是目前登記的監控主機，已停止同步。")
+                self._require_owner(book, config)
                 book = self._migrate(sheets, book)
                 snapshot = scan(book, config["include_fu"])
                 if snapshot["issues"]:
@@ -431,7 +479,13 @@ class CalendarMonitor:
                 bindings = []
                 for item in snapshot["patients"]:
                     self._checkpoint()
+                    if item["date"] and date.fromisoformat(item["date"]) < self.today():
+                        past_skipped += 1
+                        continue
                     old = self.store.get("event", item["uid"])
+                    if old and (old.get("frozen_past") or not in_calendar_range(old.get("resource"), self.today())):
+                        protected_past += 1
+                        continue
                     eid = self._binding(item, old, config)
                     expected = resource(item, config["spreadsheet_id"])
                     if expected is None:
@@ -445,6 +499,11 @@ class CalendarMonitor:
                         pending["legacy_event_id"] = old["legacy_event_id"]
                     self.store.save("event", item["uid"], pending)
                     actual = calendar.get(eid)
+                    if actual and not in_calendar_range(actual, self.today()):
+                        self.store.save("event", item["uid"], {**pending, "resource": actual,
+                            "status": "historical", "frozen_past": True})
+                        protected_past += 1
+                        continue
                     if "@" in eid and not actual:
                         raise ValueError("刀表的舊 iCalUID 查無事件，請人工核對；未以舊格式建立另一事件。")
                     if actual and "@" in eid:
@@ -462,6 +521,11 @@ class CalendarMonitor:
                     if actual and not private.get("vghksSyncId") and norm(actual.get("summary", "").split(" | ")[0]) != norm(item["mrn"]):
                         raise ValueError("既有日曆事件的病歷號與刀表不同，請先核對綁定。")
                     if not matches(actual, expected):
+                        if (not in_calendar_range(expected, self.today())
+                                or actual and not in_calendar_range(actual, self.today())):
+                            past_skipped += 1
+                            continue
+                        self._assert_owner(sheets)
                         result = calendar.update(eid, expected) if actual else calendar.insert(eid, expected)
                         if result is None:
                             raise CalendarError("日曆事件未能寫入，將於下一輪核對。")
@@ -479,6 +543,8 @@ class CalendarMonitor:
                     raise ValueError("同步期間刀表結構或識別有變動，本輪不刪除事件。")
                 for old in self.store.all("event"):
                     self._checkpoint()
+                    if old.get("frozen_past") or not in_calendar_range(old.get("resource"), self.today()):
+                        continue
                     if old["uid"] in active:
                         if old.get("missing"):
                             self.store.save("event", old["uid"], {**old, "missing": 0})
@@ -491,10 +557,19 @@ class CalendarMonitor:
                     if count < 2:
                         continue
                     actual = calendar.get(old["event_id"])
+                    if actual and not in_calendar_range(actual, self.today()):
+                        self.store.save("event", old["uid"], {**old, "resource": actual,
+                            "status": "historical", "frozen_past": True, "missing": 0})
+                        protected_past += 1
+                        continue
                     private = (actual or {}).get("extendedProperties", {}).get("private", {})
                     if actual and (private.get("vghksSyncId") != old["uid"] or private.get("vghksSource") != config["spreadsheet_id"]):
                         raise ValueError("待刪事件無法確認擁有權，保留並要求人工核對。")
                     self.store.save("event", old["uid"], {**old, "missing": count, "status": "deleting"})
+                    if (not in_calendar_range(old["resource"], self.today())
+                            or actual and not in_calendar_range(actual, self.today())):
+                        continue
+                    self._assert_owner(sheets)
                     calendar.delete(old["event_id"])
                     if calendar.get(old["event_id"]) is not None:
                         raise CalendarError("刪除事件尚未確認，下輪會先核對。")
@@ -502,7 +577,13 @@ class CalendarMonitor:
                     deleted += 1
                 self.store.save("scan", "last", {"sheet_ids": sorted(snapshot["sheet_ids"]), "at": now})
             result = {"ok": True, "updated": updated, "deleted": deleted, "at": now,
+                      "scope_from": self.today().isoformat(), "past_skipped": past_skipped,
+                      "protected_past": protected_past,
                       "message": f"同步完成：更新 {updated} 筆，刪除 {deleted} 筆。"}
+            if past_skipped:
+                result["message"] += f"略過過去排程 {past_skipped} 筆。"
+            if protected_past:
+                result["message"] += f"保留已綁定過去或日期不明事件 {protected_past} 筆；新手術請另建排程列。"
             self._status(**{k: result[k] for k in ("updated", "deleted", "message")}, issues=[])
             self.last_scan_ok = True
         except Exception as exc:
@@ -511,6 +592,11 @@ class CalendarMonitor:
             result = {"ok": False, "at": now, "message": message, "updated": updated, "deleted": deleted,
                       "failure_code": getattr(exc, "code", "") or "conflict", "retryable": bool(getattr(exc, "retryable", False))}
             self._status(message=message, issues=[message], updated=updated, deleted=deleted)
+            if result["failure_code"] == "host_conflict":
+                config = self.store.get("config", "settings")
+                config["enabled"] = False
+                self.store.save("config", "settings", config)
+                self._status(host_state="conflict")
             # Errors break consecutive-success deletion confirmation.
             for old in self.store.all("event"):
                 if old.get("missing"):

@@ -1,14 +1,17 @@
-"""Synthetic-only verification shipped in the independent monitor executable."""
+"""Synthetic-only verification shipped in the independent monitor package."""
 from __future__ import annotations
 
 import copy
 import json
 import tempfile
+import threading
+from datetime import date
 from pathlib import Path
 
 from .calendar_client import CalendarUncertain
 from .calendar_monitor import CalendarMonitor
 from .calendar_sync import scan
+from .google_sheets import SheetError
 
 MONTH_HEADERS = ["日期／報到時間", "醫院", "病歷號", "姓名", "TEL", "GA", "側別", "診斷",
                  "Grade", "術式", "IOL", "IOL Target", "IOL Final", "Axis", "Plan", "心得",
@@ -45,16 +48,33 @@ class MemorySheets:
     def __init__(self, book):
         self.book = copy.deepcopy(book)
         self.writes = []
+        self.lock = threading.RLock()
 
     def read_all(self):
-        return copy.deepcopy(self.book)
+        with self.lock:
+            return copy.deepcopy(self.book)
+
+    def read_metadata(self):
+        with self.lock:
+            return {"developerMetadata": copy.deepcopy(self.book.get("developerMetadata", []))}
 
     def write(self, requests):
+        with self.lock:
+            return self._write(requests)
+
+    def _write(self, requests):
+        ids = {item["metadataId"] for item in self.book.get("developerMetadata", [])}
+        for request in requests:
+            metadata = request.get("createDeveloperMetadata", {}).get("developerMetadata", {})
+            if metadata.get("metadataId") in ids:
+                raise SheetError("Synthetic duplicate metadata ID")
+            if metadata.get("metadataId"):
+                ids.add(metadata["metadataId"])
         self.writes.extend(copy.deepcopy(requests))
         for request in requests:
             kind, body = next(iter(request.items()))
             if kind == "createDeveloperMetadata":
-                self.book["developerMetadata"].append({**body["developerMetadata"], "metadataId": 1})
+                self.book["developerMetadata"].append({"metadataId": 1, **body["developerMetadata"]})
                 continue
             if kind == "updateDeveloperMetadata":
                 self.book["developerMetadata"][0].update(body["developerMetadata"])
@@ -121,7 +141,8 @@ class MemoryCalendar:
 
 def prepared(directory, book=None):
     sheets, calendar = MemorySheets(book or workbook()), MemoryCalendar()
-    monitor = CalendarMonitor(directory, clients=lambda _: (sheets, calendar), background=False)
+    monitor = CalendarMonitor(directory, clients=lambda _: (sheets, calendar), background=False,
+                              today=lambda: date(2026, 10, 1))
     monitor.configure({"spreadsheet_id": "synthetic-spreadsheet-00000000000", "calendar_id": "synthetic-calendar"})
     try:
         monitor.prepare()
