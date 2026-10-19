@@ -425,12 +425,12 @@ wheels = [
 
 [[package]]
 name = "vghks-sheet-core"
-version = "1.2.1"
-source = { git = "https://github.com/eyeduck-ai/op_spreadsheet.git?subdirectory=packages%2Fpython&rev=8eeecef64ef3d48ad72d3207afcf35ee849ef6f7#8eeecef64ef3d48ad72d3207afcf35ee849ef6f7" }
+version = "1.2.2"
+source = { git = "https://github.com/eyeduck-ai/op_spreadsheet.git?subdirectory=packages%2Fpython&rev=95f7b32a319de7adc484d54aeb5199315b81079e#95f7b32a319de7adc484d54aeb5199315b81079e" }
 
 [[package]]
 name = "vghks-sheet2cal"
-version = "1.2.1"
+version = "1.2.2"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },
@@ -450,6 +450,6 @@ requires-dist = [
     { name = "google-auth", extras = ["requests"], specifier = "==2.58.0" },
     { name = "requests", specifier = "==2.34.2" },
     { name = "ruff", marker = "extra == 'dev'", specifier = "==0.14.14" },
-    { name = "vghks-sheet-core", git = "https://github.com/eyeduck-ai/op_spreadsheet.git?subdirectory=packages%2Fpython&rev=8eeecef64ef3d48ad72d3207afcf35ee849ef6f7" },
+    { name = "vghks-sheet-core", git = "https://github.com/eyeduck-ai/op_spreadsheet.git?subdirectory=packages%2Fpython&rev=95f7b32a319de7adc484d54aeb5199315b81079e" },
 ]
 provides-extras = ["dev"]
