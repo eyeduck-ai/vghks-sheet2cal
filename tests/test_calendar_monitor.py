@@ -13,6 +13,51 @@ from vghks_sheet2cal.selftest_calendar import FU_HEADERS, cell, checks, monthly,
 
 
 class MonitorTests(unittest.TestCase):
+    def test_optional_patient_hospital_cells_survive_setup_sync_and_day_changes(self):
+        for patient_cell in ({}, cell("高榮"), cell("聯醫"),
+                             {"userEnteredValue": {"formulaValue": '="聯醫"'}, "formattedValue": "聯醫"}):
+            with self.subTest(cell=patient_cell), tempfile.TemporaryDirectory() as directory:
+                book = workbook()
+                tab = book["sheets"][0]
+                _, cols = headers(tab)
+                tab["rows"][2][cols["醫院"]] = copy.deepcopy(patient_cell)
+                tab["rows"][4][cols["醫院"]] = {}
+                monitor, sheets, calendar = prepared(directory, book)
+                try:
+                    self.assertTrue(monitor.run_once()["ok"])
+                    target = sheets.book["sheets"][0]
+                    self.assertEqual(target["rows"][2][cols["醫院"]], patient_cell)
+                    self.assertEqual(target["rows"][4][cols["醫院"]], {})
+                    patient = scan(sheets.book)["patients"][0]
+                    self.assertIn("醫院: 高榮", calendar.events[patient["event_id"]]["description"])
+                    target["rows"][1][cols["醫院"]] = cell("聯醫")
+                    target["rows"][1][cols["日期／報到時間"]] = cell("2026-10-13")
+                    self.assertTrue(monitor.run_once()["ok"])
+                    self.assertEqual(target["rows"][2][cols["醫院"]], patient_cell)
+                    self.assertEqual(target["rows"][4][cols["醫院"]], {})
+                    self.assertIn("醫院: 聯醫", calendar.events[patient["event_id"]]["description"])
+                finally:
+                    monitor.close()
+
+    def test_past_and_future_months_are_reconciled_without_a_date_cutoff(self):
+        tabs = []
+        for sid, year in ((1, 2000), (2, 2099)):
+            tab = monthly(f"{year}01", sid)
+            tab["rows"] = tab["rows"][:3]
+            _, cols = headers(tab)
+            tab["rows"][1][cols["日期／報到時間"]] = cell(f"{year}-01-12")
+            tab["rows"][1][cols["ScheduleSyncId"]] = cell(f"{sid * 10:032x}")
+            tab["rows"][2][cols["ScheduleSyncId"]] = cell(f"{sid * 10 + 1:032x}")
+            tabs.append(tab)
+        with tempfile.TemporaryDirectory() as directory:
+            monitor, _, calendar = prepared(directory, workbook(*tabs))
+            try:
+                self.assertTrue(monitor.run_once()["ok"])
+                self.assertEqual(calendar.inserts, 2)
+                self.assertEqual({event["start"]["dateTime"][:4] for event in calendar.events.values()}, {"2000", "2099"})
+            finally:
+                monitor.close()
+
     def test_unchanged_workbook_read_budget_is_constant_with_patients_and_months(self):
         from vghks_sheet2cal.selftest_calendar import MONTH_HEADERS
         for count, months in ((10, 1), (50, 12), (200, 24)):
@@ -135,7 +180,7 @@ class MonitorTests(unittest.TestCase):
             finally:
                 monitor.close()
 
-    def test_local_patient_binding_is_checked_before_hospital_normalization(self):
+    def test_patient_binding_conflict_preserves_optional_hospital(self):
         with tempfile.TemporaryDirectory() as directory:
             monitor, sheets, calendar = prepared(directory)
             try:

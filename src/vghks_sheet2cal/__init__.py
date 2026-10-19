@@ -1,2 +1,2 @@
 """Independent hourly VGHKS Sheets-to-Calendar service."""
-__version__ = "1.0.2"
+__version__ = "1.1.0"

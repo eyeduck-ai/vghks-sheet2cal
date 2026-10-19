@@ -1,0 +1,55 @@
+name: Publish standalone monitor
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    uses: ./.github/workflows/verify.yml
+
+  release:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - run: python -m pip install build==1.3.0
+      - run: python -m build
+      - name: Verify tag, package metadata and source boundary
+        run: |
+          python - <<'PY'
+          import email, os, tarfile, tomllib, zipfile
+          from pathlib import Path
+          project = tomllib.loads(Path('pyproject.toml').read_text())['project']
+          assert os.environ['RELEASE_TAG'] == 'v' + project['version']
+          wheel, = Path('dist').glob('*.whl')
+          source, = Path('dist').glob('*.tar.gz')
+          with zipfile.ZipFile(wheel) as archive:
+              metadata, = [name for name in archive.namelist() if name.endswith('.dist-info/METADATA')]
+              message = email.message_from_bytes(archive.read(metadata))
+              assert message['Version'] == project['version']
+              expected = next(value for value in project['dependencies'] if value.startswith('vghks-sheet-core @ '))
+              assert expected.replace(' ', '') in [value.replace(' ', '') for value in message.get_all('Requires-Dist')]
+          with tarfile.open(source) as archive:
+              names = [Path(item.name) for item in archive.getmembers()]
+              assert all(not {'.local', '.upstream', '.runtime', '.git', '.venv'} & set(name.parts) for name in names)
+              assert all('.sqlite3' not in name.name and not name.name.startswith('service-account') for name in names)
+              assert any(name.as_posix().endswith('/scripts/deploy.sh') for name in names)
+          changes = Path('CHANGELOG.md').read_text().split('# ' + project['version'] + '\n', 1)[1].split('\n# ', 1)[0]
+          Path('dist/RELEASE_NOTES.md').write_text(changes.strip() + '\n')
+          PY
+          cd dist
+          sha256sum *.whl *.tar.gz > SHA256SUMS.txt
+      - name: Publish verified packages
+        run: gh release create "$RELEASE_TAG" --verify-tag --title "VGHKS Sheet2Cal $RELEASE_TAG" --notes-file dist/RELEASE_NOTES.md dist/*.whl dist/*.tar.gz dist/SHA256SUMS.txt

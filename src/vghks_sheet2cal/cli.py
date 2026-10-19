@@ -102,7 +102,7 @@ def main(argv=None):
             keyfile = Path(values.pop("service_account_file")).expanduser()
             if not keyfile.is_absolute():
                 keyfile = args.file.resolve().parent / keyfile
-            values.update(key=json.loads(keyfile.read_text(encoding="utf-8")), enabled=False, autorun=False)
+            values.update(key=json.loads(keyfile.read_text(encoding="utf-8")), enabled=False)
             result = control(directory, "/api/config", values)
         elif args.command == "prepare":
             result = control(directory, "/api/prepare", {"takeover": args.takeover})

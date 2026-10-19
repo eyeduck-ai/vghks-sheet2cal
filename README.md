@@ -2,7 +2,11 @@
 
 獨立的 Google 刀表 → Google Calendar 常駐監控，包含月份手術與 FU／All，預設每 **60 分鐘**同步。部署於 Linux，不需要院內 SDK、院內帳號或主程式持續開啟。
 
-保留永久 `ScheduleSyncId`、既有 `CalendarEventId`、固定新事件 ID、跨月搬列、取消灰色事件、原生封存保護、寫後讀回核對及連續缺列刪除確認。同步結果不回寫院內系統。監控會維護刀表技術欄與核對後的院區，實際日曆事件由單一指定主機寫入。
+保留永久 `ScheduleSyncId`、既有 `CalendarEventId`、固定新事件 ID、跨月搬列、取消灰色事件、原生封存保護、寫後讀回核對及連續缺列刪除確認。同步結果不回寫院內系統。監控只維護必要系統識別與事件綁定。患者醫院欄可留白、手填或保留公式，不補填或覆寫；日期與院區依最近有效刀日判斷。Calendar 由單一指定主機寫入。
+
+## 同步範圍
+
+每輪掃描所有受支援的 `YYYYMM` 月份與 FU／All，**包含過去與未來日期**，不是只處理今天以後。刀日標題不建立事件，無日期 FU 不建事件；年度封存的 ID 用於保護既有事件，不由封存列建立新事件。手填患者院區不會改變刀日的有效院區。
 
 ## 安裝與常駐部署
 
@@ -63,7 +67,7 @@ systemctl --user restart vghks-sheet2cal.service
 
 ## 共用規格與相容性
 
-正式來源位於 [op_spreadsheet 的刀表契約](https://github.com/eyeduck-ai/op_spreadsheet/tree/codex-shared-sheet-contract/contracts)，Python 共用套件位於同 repo 的 `packages/python`。本專案依賴固定的完整 Git commit；`compatibility.json` 記錄已驗證的搭配版本。一般更新不會在背景下載規格。
+契約版本 **1.1.0**。正式來源位於 [op_spreadsheet 的刀表契約](https://github.com/eyeduck-ai/op_spreadsheet/tree/master/contracts)，Python 共用套件位於同 repo 的 `packages/python`。本專案依賴固定的完整 Git commit；`compatibility.json` 記錄已驗證的搭配版本。一般更新不會在背景下載規格。
 
 主程式與此監控使用同一份 `vghks-sheet-core` 欄位解析、永久識別、共享基準與日曆呈現。GAS 使用生成的欄位定義，並以真實 GAS 匯出案例驗證解析及操作語意。更新步驟見該 repo 的 `docs/SHEET_CONTRACT.md`。
 
@@ -78,4 +82,10 @@ uv run --locked python -m vghks_sheet_core.verify
 
 測試只使用合成資料與記憶體 Google 用戶端，涵蓋 FU、改期、事件 ID、重啟續接、刪除確認、API 重試、封存互斥、跨程序鎖、loopback 驗證與 SIGTERM 停止。CI 另取得固定 GAS source，執行真實匯出器，核對共用核心及指定主程式版本。
 
-`UPSTREAM.json` 記錄拆分來源。原 `vghks-bot` 的 Windows 監控入口暫留作相容用途；同一刀表仍僅啟用一個監控。
+`UPSTREAM.json` 記錄拆分來源。主程式 repo 只提供 VGHKS-bot.exe；監控在此 repo 獨立維護、發布及部署。同一刀表只啟用一個監控。
+
+## 獨立發布
+
+[Releases](https://github.com/eyeduck-ai/vghks-sheet2cal/releases) 提供 Python wheel、完整 source distribution 及 SHA256SUMS.txt。常駐部署使用本 repo 的 scripts/deploy.sh，版本與主程式分開維護。
+
+更新 pyproject、套件版本與 CHANGELOG，確認相容 commit 及 CI 成功後推送相符的 v* 標籤；Release workflow 再執行完整驗證並建立安裝套件。來源與發行包不包含本機設定、金鑰、資料庫或備份。

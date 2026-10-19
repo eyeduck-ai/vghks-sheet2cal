@@ -14,7 +14,7 @@ from pathlib import Path
 
 from google.auth.transport.requests import AuthorizedSession
 from google.oauth2 import service_account
-from vghks_sheet_core.cells import cell_at, fingerprint
+from vghks_sheet_core.cells import fingerprint
 from vghks_sheet_core.common import norm
 
 from .calendar_client import CalendarClient, CalendarError
@@ -22,18 +22,14 @@ from .calendar_sync import (
     OWNER_KEY,
     digest,
     event_id,
-    headers,
     matches,
     resource,
     scan,
-    sheet_kind,
-    value,
 )
 from .google_sheets import GoogleSettings, SheetError, SheetsClient, spreadsheet_id
 from .locking import lock_file
 from .portable_credentials import seal, unseal
 from .settings import TAIPEI, timestamp
-from .sheet_schema import monthly_row
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/calendar.events"]
 
@@ -57,7 +53,7 @@ class MonitorStore:
         if self.get("config", "settings") is None:
             self.save("config", "settings", {"spreadsheet_id": "", "calendar_id": "", "email": "",
                 "enabled": False, "include_fu": True, "hours": 1, "setup_done": False,
-                "worker_id": uuid.uuid4().hex, "next_check": "", "last_attempt": "", "autorun": False})
+                "worker_id": uuid.uuid4().hex, "next_check": "", "last_attempt": ""})
 
     @contextmanager
     def connect(self):
@@ -109,27 +105,6 @@ class MonitorStore:
         self.handle.close()
 
 
-def autorun(enabled, directory):
-    if sys.platform != "win32":
-        if enabled:
-            raise ValueError("登入後啟動僅適用於 Windows。")
-        return
-    import subprocess
-    import winreg
-    if not getattr(sys, "frozen", False) and enabled:
-        raise ValueError("請使用監控 EXE 設定登入後啟動。")
-    name = "VGHKSCalendarMonitor-" + digest(str(Path(directory).resolve()))[:12]
-    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run") as key:
-        if enabled:
-            command = subprocess.list2cmdline([sys.executable, "--no-browser", "--data-dir", str(directory)])
-            winreg.SetValueEx(key, name, 0, winreg.REG_SZ, command)
-        else:
-            try:
-                winreg.DeleteValue(key, name)
-            except FileNotFoundError:
-                pass
-
-
 def metadata_owner(book):
     owners = [m for m in book.get("developerMetadata", []) if m.get("metadataKey") == OWNER_KEY]
     if len(owners) > 1:
@@ -144,39 +119,6 @@ def metadata_owner(book):
 
 def owner_matches(owner, config):
     return owner == {k: config[k] for k in ("worker_id", "spreadsheet_id", "calendar_id")}
-
-
-def normalize_hospital_requests(book):
-    requests_ = []
-    for sheet in book.get("sheets", []):
-        if sheet_kind(sheet) != "MONTHLY":
-            continue
-        _, cols = headers(sheet)
-        if not {"醫院", "日期／報到時間", "病歷號"} <= cols.keys():
-            continue
-        hospital = ""
-        for index, row in enumerate(sheet.get("rows", [])[1:], 1):
-            parsed = monthly_row(row, cols)
-            if parsed["kind"] == "day":
-                hospital = parsed["hospital"]
-                continue
-            if parsed["kind"] == "invalid_header":
-                hospital = ""
-                continue
-            if not hospital or parsed["kind"] != "patient":
-                continue
-            cell = cell_at(row, cols["醫院"])
-            if cell.get("userEnteredValue", {}).get("formulaValue"):
-                if value(row, cols, "醫院") != hospital:
-                    raise ValueError(sheet["properties"]["title"] + " 院區欄為公式且與刀日不同，請先核對。")
-                continue
-            if value(row, cols, "醫院") == hospital:
-                continue
-            requests_.append({"updateCells": {"range": {"sheetId": sheet["properties"]["sheetId"],
-                "startRowIndex": index, "endRowIndex": index + 1, "startColumnIndex": cols["醫院"],
-                "endColumnIndex": cols["醫院"] + 1}, "rows": [{"values": [{"userEnteredValue": {"stringValue": hospital}}]}],
-                "fields": "userEnteredValue"}})
-    return requests_
 
 
 class CalendarMonitor:
@@ -210,7 +152,7 @@ class CalendarMonitor:
         try:
             config = self.store.get("config", "settings")
             changed = dict(config)
-            for field in ("spreadsheet_id", "calendar_id", "include_fu", "hours", "enabled", "autorun"):
+            for field in ("spreadsheet_id", "calendar_id", "include_fu", "hours", "enabled"):
                 if field in values:
                     changed[field] = values[field]
             changed["spreadsheet_id"] = spreadsheet_id(changed["spreadsheet_id"])
@@ -219,7 +161,7 @@ class CalendarMonitor:
             changed["calendar_id"] = changed["calendar_id"].strip()
             if type(changed["hours"]) is not int or not 1 <= changed["hours"] <= 720:
                 raise ValueError("監控頻率需為 1–720 小時。")
-            if any(type(changed[k]) is not bool for k in ("enabled", "include_fu", "autorun")):
+            if any(type(changed[k]) is not bool for k in ("enabled", "include_fu")):
                 raise ValueError("監控選項格式不正確。")
             target_changed = any(changed[k] != config[k] for k in ("spreadsheet_id", "calendar_id"))
             if target_changed and self.store.all("event"):
@@ -231,8 +173,7 @@ class CalendarMonitor:
             if values.get("key"):
                 self.store.key(values["key"])
                 changed["email"] = values["key"]["client_email"]
-            if changed["autorun"] != config["autorun"]:
-                autorun(changed["autorun"], self.store.directory)
+            changed.pop("autorun", None)
             if changed["enabled"] and not config["enabled"]:
                 changed["next_check"] = timestamp()
             self.store.save("config", "settings", changed)
@@ -277,7 +218,7 @@ class CalendarMonitor:
         if missing_old and any(p["uid"] not in before["identities"] for p in expected["patients"]):
             raise ValueError("舊排程識別消失且有新識別待配置，請核對是否僅搬移可見欄位；未變更刀表或日曆。")
         self._validate_bindings(plan["book"], expected)
-        requests_ = plan["requests"] + normalize_hospital_requests(plan["book"])
+        requests_ = plan["requests"]
         if not requests_:
             return book
         fresh = self._read_monitor(sheets)
@@ -621,9 +562,3 @@ class CalendarMonitor:
             self.thread.join()
         with self.busy:
             self.store.close()
-
-
-def self_test(path):
-    # Imported only for offline verification; no credentials or network access.
-    from .selftest_calendar import self_test as run
-    return run(path)
