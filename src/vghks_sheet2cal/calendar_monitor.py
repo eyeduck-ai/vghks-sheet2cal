@@ -28,6 +28,7 @@ from .calendar_sync import (
     resource,
     scan,
     schedule_in_calendar_range,
+    schedule_requires_reconciliation,
 )
 from .google_sheets import GoogleSettings, SheetError, SheetsClient, spreadsheet_id
 from .host_registration import current_host_id
@@ -262,16 +263,18 @@ class CalendarMonitor:
         patient_ids = {item["uid"] for item in snapshot["patients"]}
         header_ids = snapshot["identities"] - patient_ids - snapshot["archive_ids"]
         historical_ids = {old["uid"] for old in self.store.all("event")
-                          if old.get("frozen_past") or not in_calendar_range(old.get("resource"), self.today())}
+                          if old.get("status") != "pending"
+                          and (old.get("frozen_past") or not in_calendar_range(old.get("resource"), self.today()))}
         bound_ids = {old["uid"] for old in self.store.all("event") if old.get("status") != "deleted"}
         bound_ids.update(uid for uid, state in shared["states"].items() if state.get("mrn_hash"))
         bound_ids -= historical_ids
         if header_ids & bound_ids:
             raise ValueError("已綁定患者的排程 ID 變成刀日標題，請核對列類型與識別；未變更刀表或日曆。")
         for item in snapshot["patients"]:
-            if item["date"] and not schedule_in_calendar_range(item, self.today()):
+            old = self.store.get("event", item["uid"])
+            if item["date"] and not schedule_requires_reconciliation(item, self.today(), old):
                 continue
-            self._binding(item, self.store.get("event", item["uid"]), config)
+            self._binding(item, old, config)
             state = shared["states"].get(item["uid"], {})
             bound_mrn = state.get("mrn_hash") or state.get("fields", {}).get("mrn")
             if bound_mrn and bound_mrn != field_hash("mrn", item["mrn"]):
@@ -381,14 +384,16 @@ class CalendarMonitor:
                              host_check_at=timestamp())
                 plan = plan_identity_setup(book, include_archives=True)
                 snapshot = scan(plan["book"], config["include_fu"])
-                today = self.today().isoformat()
+                cutoff = self.today()
+                today = cutoff.isoformat()
                 return {"ok": not plan["issues"] and not snapshot["issues"] and (not owner or matched),
                         "issues": plan["issues"] + snapshot["issues"],
                         "planned_technical_requests": len(plan["requests"]),
                         "monthly_rows": sum(p["kind"] == "MONTHLY" for p in snapshot["patients"]),
                         "fu_rows": sum(p["kind"] == "FU" for p in snapshot["patients"]),
                         "scope_from": today,
-                        "eligible_rows": sum(bool(p["date"]) and p["date"] >= today for p in snapshot["patients"]),
+                        "eligible_rows": sum(schedule_requires_reconciliation(
+                            p, cutoff, self.store.get("event", p["uid"])) for p in snapshot["patients"]),
                         "owner_registered": bool(owner), "owner_matches": matched,
                         "calendar_readable": True}
         finally:
@@ -476,13 +481,13 @@ class CalendarMonitor:
                 # Presence anywhere protects an existing event, even if the
                 # row's type changed and it is no longer an eligible patient.
                 active = snapshot["identities"]
-                bindings = []
+                bindings, completed = [], []
                 for item in snapshot["patients"]:
                     self._checkpoint()
-                    if item["date"] and not schedule_in_calendar_range(item, self.today()):
+                    old = self.store.get("event", item["uid"])
+                    if item["date"] and not schedule_requires_reconciliation(item, self.today(), old):
                         past_skipped += 1
                         continue
-                    old = self.store.get("event", item["uid"])
                     eid = self._binding(item, old, config)
                     expected = resource(item, config["spreadsheet_id"])
                     if expected is None:
@@ -496,6 +501,11 @@ class CalendarMonitor:
                         pending["legacy_event_id"] = old["legacy_event_id"]
                     self.store.save("event", item["uid"], pending)
                     actual = calendar.get(eid)
+                    # Finish an in-flight move into the past, but never create
+                    # a past event if the original no longer exists.
+                    if not schedule_in_calendar_range(item, self.today()) and actual is None:
+                        self.store.save("event", item["uid"], {**pending, "status": "historical"})
+                        continue
                     if "@" in eid and not actual:
                         raise ValueError("刀表的舊 iCalUID 查無事件，請人工核對；未以舊格式建立另一事件。")
                     if actual and "@" in eid:
@@ -513,9 +523,6 @@ class CalendarMonitor:
                     if actual and not private.get("vghksSyncId") and norm(actual.get("summary", "").split(" | ")[0]) != norm(item["mrn"]):
                         raise ValueError("既有日曆事件的病歷號與刀表不同，請先核對綁定。")
                     if not matches(actual, expected):
-                        if not in_calendar_range(expected, self.today()):
-                            past_skipped += 1
-                            continue
                         self._assert_owner(sheets)
                         result = calendar.update(eid, expected) if actual else calendar.insert(eid, expected)
                         if result is None:
@@ -525,8 +532,12 @@ class CalendarMonitor:
                         updated += 1
                     if item["event_id"] != eid:
                         bindings.append((item, eid))
-                    self.store.save("event", item["uid"], {**pending, "event_id": eid, "status": "ready"})
+                    completed.append((item["uid"], {**pending, "event_id": eid, "status": "ready"}))
                 self._write_bindings(sheets, bindings)
+                # Keep pending state until both Calendar and sheet bindings are
+                # verified, so a failed binding write can resume even in the past.
+                for uid, ready in completed:
+                    self.store.save("event", uid, ready)
                 self._checkpoint()
                 # Re-read the complete workbook before considering any disappearance.
                 final = scan(self._read_monitor(sheets), config["include_fu"])
