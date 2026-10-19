@@ -6,9 +6,9 @@
 
 ## 同步範圍
 
-只同步 **Asia/Taipei 今天起**的月份排程與 FU／All；今天包含整天。過去日曆事件不查詢、更新或刪除，既有綁定保留。刀日與無日期 FU 不建事件；手填患者院區不改變刀日的有效院區。
+只同步 **Asia/Taipei 今天起**的月份排程與 FU／All；今天包含整天。依刀表目前日期判斷，仍在過去的排程不查詢或變更日曆，既有綁定保留。刀日與無日期 FU 不建事件；手填患者院區不改變刀日的有效院區。
 
-刀表仍完整讀取受支援月份、FU／All 與封存的排程 ID，避免把搬列或封存誤判成刪除；不依月份名稱略過分頁。已成為過去的排程保持原樣，需要安排新手術時請建立新的排程列。
+刀表仍完整讀取受支援月份、FU／All 與封存的排程 ID，避免把搬列或封存誤判成刪除；不依月份名稱略過分頁。過去排程改到今天或未來後，恢復同步並更新原本綁定的日曆事件，沿用 ScheduleSyncId 與 CalendarEventId，不需新增排程列。舊快取日期或歷史保護標記不阻擋改期；缺列且已過去或日期不明的事件仍保留。
 
 ## 安裝與常駐部署
 
@@ -75,7 +75,7 @@ systemctl --user restart vghks-sheet2cal.service
 
 ## 共用規格與相容性
 
-契約版本 **1.2.0**。正式來源位於 [op_spreadsheet 的刀表契約](https://github.com/eyeduck-ai/op_spreadsheet/tree/master/contracts)，Python 共用套件位於同 repo 的 `packages/python`。本專案依賴固定的完整 Git commit；`compatibility.json` 記錄已驗證的搭配版本。一般更新不會在背景下載規格。
+契約版本 **1.2.1**。正式來源位於 [op_spreadsheet 的刀表契約](https://github.com/eyeduck-ai/op_spreadsheet/tree/master/contracts)，Python 共用套件位於同 repo 的 `packages/python`。本專案依賴固定的完整 Git commit；`compatibility.json` 記錄已驗證的搭配版本。一般更新不會在背景下載規格。
 
 主程式與此監控使用同一份 `vghks-sheet-core` 欄位解析、永久識別、共享基準與日曆呈現。GAS 使用生成的欄位定義，並以真實 GAS 匯出案例驗證解析及操作語意。更新步驟見該 repo 的 `docs/SHEET_CONTRACT.md`。
 
