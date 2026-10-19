@@ -152,9 +152,9 @@ class MonitorHandler(BaseHTTPRequestHandler):
         elif path == "/api/config":
             self.reply(200, app.configure(values))
         elif path == "/api/prepare":
-            if type(values.get("takeover", False)) is not bool:
-                raise ValueError("主機接替選項格式錯誤。")
-            self.reply(200, app.prepare(values.get("takeover", False)))
+            if values:
+                raise ValueError("主機登記不接受額外選項。")
+            self.reply(200, app.prepare())
         elif path == "/api/check":
             self.reply(200, app.inspect())
         elif path == "/api/run":

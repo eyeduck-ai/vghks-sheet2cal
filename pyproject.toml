@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vghks-sheet2cal"
-version = "1.1.0"
+version = "1.2.0"
 description = "Independent persistent VGHKS surgery and FU calendar monitor"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["google-auth[requests]==2.58.0", "cryptography==50.0.1", "requests==2.34.2", "vghks-sheet-core @ git+https://github.com/eyeduck-ai/op_spreadsheet.git@3fc44ad3685f382c2930f91d696eb965bf5db4dd#subdirectory=packages/python"]
+dependencies = ["google-auth[requests]==2.58.0", "cryptography==50.0.1", "requests==2.34.2", "vghks-sheet-core @ git+https://github.com/eyeduck-ai/op_spreadsheet.git@e37925315fb78d091f7df8e981e8cc56e524afc2#subdirectory=packages/python"]
 
 [project.optional-dependencies]
 dev = ["ruff==0.14.14"]
