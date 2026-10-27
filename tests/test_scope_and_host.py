@@ -54,6 +54,7 @@ class ScopeTests(unittest.TestCase):
                 monitor.today = lambda: date(2026, 10, 13)
                 _, cols = headers(sheets.book["sheets"][0])
                 sheets.book["sheets"][0]["rows"][2][cols["病歷號"]] = cell("00999")
+                sheets.book["sheets"][0]["rows"][2][cols["姓名"]] = cell("另一位合成患者")
                 sheets.book["sheets"][0]["rows"].pop(4)
                 with patch.object(calendar, "get", wraps=calendar.get) as get:
                     for _ in range(3):
@@ -216,6 +217,7 @@ class ScopeTests(unittest.TestCase):
                 monitor.today = lambda: date(2026, 10, 13)
                 _, cols = headers(sheets.book["sheets"][0])
                 sheets.book["sheets"][0]["rows"][2][cols["病歷號"]] = cell("00999")
+                sheets.book["sheets"][0]["rows"][2][cols["姓名"]] = cell("另一位合成患者")
                 self.assertTrue(monitor.run_once()["ok"])
                 sheets.book["sheets"][0]["rows"][1][cols["日期／報到時間"]] = cell("2026-10-20")
                 with patch.object(calendar, "get", wraps=calendar.get) as get:
