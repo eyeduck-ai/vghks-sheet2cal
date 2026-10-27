@@ -21,6 +21,7 @@ from .calendar_client import CalendarClient, CalendarError
 from .calendar_sync import (
     OWNER_KEY,
     OWNER_METADATA_ID,
+    calendar_binding_compatible,
     digest,
     event_id,
     in_calendar_range,
@@ -37,6 +38,15 @@ from .portable_credentials import seal, unseal
 from .settings import TAIPEI, timestamp
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/calendar.events"]
+
+
+class RowSyncError(ValueError):
+    """A bounded row needs review; other rows can still be reconciled."""
+
+
+def row_issue(item, exc, code="row_conflict"):
+    return {"uid": item["uid"], "sheet": item["sheet"], "row": item["row"] + 1,
+            "code": code, "message": str(exc)}
 
 
 class MonitorStore:
@@ -270,15 +280,31 @@ class CalendarMonitor:
         bound_ids -= historical_ids
         if header_ids & bound_ids:
             raise ValueError("已綁定患者的排程 ID 變成刀日標題，請核對列類型與識別；未變更刀表或日曆。")
+        issues = list(snapshot.get("row_issues", []))
+        quarantined = {issue["uid"] for issue in issues}
         for item in snapshot["patients"]:
             old = self.store.get("event", item["uid"])
             if item["date"] and not schedule_requires_reconciliation(item, self.today(), old):
                 continue
-            self._binding(item, old, config)
-            state = shared["states"].get(item["uid"], {})
-            bound_mrn = state.get("mrn_hash") or state.get("fields", {}).get("mrn")
-            if bound_mrn and bound_mrn != field_hash("mrn", item["mrn"]):
-                raise ValueError(item["sheet"] + " 排程 ID 與主程式原病歷號綁定不符，未變更刀表或日曆。")
+            if item["uid"] in quarantined:
+                continue
+            try:
+                self._binding(item, old, config)
+                try:
+                    expected = resource(item, config["spreadsheet_id"])
+                except ValueError as exc:
+                    raise RowSyncError(str(exc)) from exc
+                if expected is None and (old or item["event_id"]):
+                    raise RowSyncError("已綁定追蹤列清空日期，請人工確認；事件保留。")
+                state = shared["states"].get(item["uid"], {})
+                bound_mrn = state.get("mrn_hash") or state.get("fields", {}).get("mrn")
+                # A trusted local Calendar binding can survive a campus MRN
+                # change. First adoption still requires the shared baseline.
+                if not old and bound_mrn and bound_mrn != field_hash("mrn", item["mrn"]):
+                    raise RowSyncError("排程 ID 與主程式原病歷號綁定不符，請先核對首次綁定。")
+            except RowSyncError as exc:
+                issues.append(row_issue(item, exc))
+        return issues
 
     def pause(self):
         # Pausing must also work before the first configuration is complete.
@@ -348,7 +374,11 @@ class CalendarMonitor:
                 self._assert_owner(sheets)
             config["setup_done"] = True
             self.store.save("config", "settings", config)
-            self._status(message="準備完成。啟用後每小時同步；目前仍停用。", issues=[])
+            issues = self._validate_bindings(book, scan(book, config["include_fu"]))
+            message = "準備完成。啟用後每小時同步；目前仍停用。"
+            if issues:
+                message += f"有 {len(issues)} 列待核對，啟用後其餘列仍可同步。"
+            self._status(message=message, issues=[], row_issues=issues, partial=False)
             return self.public()
         finally:
             self.busy.release()
@@ -384,10 +414,12 @@ class CalendarMonitor:
                              host_check_at=timestamp())
                 plan = plan_identity_setup(book, include_archives=True)
                 snapshot = scan(plan["book"], config["include_fu"])
+                row_issues = self._validate_bindings(plan["book"], snapshot) if not snapshot["issues"] else []
                 cutoff = self.today()
                 today = cutoff.isoformat()
-                return {"ok": not plan["issues"] and not snapshot["issues"] and (not owner or matched),
+                return {"ok": not plan["issues"] and not snapshot["issues"] and not row_issues and (not owner or matched),
                         "issues": plan["issues"] + snapshot["issues"],
+                        "row_issues": row_issues,
                         "planned_technical_requests": len(plan["requests"]),
                         "monthly_rows": sum(p["kind"] == "MONTHLY" for p in snapshot["patients"]),
                         "fu_rows": sum(p["kind"] == "FU" for p in snapshot["patients"]),
@@ -404,11 +436,11 @@ class CalendarMonitor:
             self.status.update(values)
 
     def _binding(self, item, old, config):
-        if old and old["identity"] != item["identity"]:
-            raise ValueError(item["sheet"] + " 排程 ID 對應病人已變更，疑似只搬移可見欄位；未更新日曆。")
+        if not calendar_binding_compatible(item, old):
+            raise RowSyncError("排程 ID 對應病人已變更，病歷號與姓名均無法核對；原事件保留。")
         sheet_event = item["event_id"]
         if old and sheet_event and sheet_event not in {old["event_id"], old.get("legacy_event_id")}:
-            raise ValueError(item["sheet"] + " 事件綁定與監控紀錄不一致，請核對。")
+            raise RowSyncError("事件綁定與監控紀錄不一致，請核對；原事件保留。")
         return (old or {}).get("event_id") or sheet_event or event_id(config["spreadsheet_id"], item["uid"])
 
     @staticmethod
@@ -417,8 +449,9 @@ class CalendarMonitor:
         return reader()
 
     def _write_bindings(self, sheets, bindings):
-        # Re-locate permanent IDs immediately before each bounded batch. Never
-        # reuse initial row numbers after Calendar requests or a concurrent move.
+        # Relocate stable IDs before each bounded batch. A changed row must not
+        # prevent other verified bindings from reaching durable ready state.
+        succeeded, issues = set(), []
         for start in range(0, len(bindings), 100):
             self._checkpoint()
             batch = bindings[start:start + 100]
@@ -426,15 +459,18 @@ class CalendarMonitor:
             if current["issues"]:
                 raise ValueError("回寫事件 ID 前刀表有衝突，事件已保存在監控紀錄，稍後重試。")
             indexed = {p["uid"]: p for p in current["patients"]}
-            requests_ = []
+            requests_, valid = [], []
             for item, eid in batch:
                 target = indexed.get(item["uid"])
                 if not target or target["identity"] != item["identity"]:
-                    raise ValueError("回寫事件 ID 前病人列已搬移或變更，請重新核對。")
+                    issues.append(row_issue(item, "回寫事件 ID 前病人列已移動或變更，待下輪核對。"))
+                    continue
+                if target["event_id"] and target["event_id"] not in {eid, item["event_id"]}:
+                    issues.append(row_issue(target, "既有事件 ID 已由其他操作變更，未覆寫。"))
+                    continue
+                valid.append((item, eid))
                 if target["event_id"] == eid:
                     continue
-                if target["event_id"] and target["event_id"] != item["event_id"]:
-                    raise ValueError("既有事件 ID 已由其他操作變更，未覆寫。")
                 col = target["cols"]["CalendarEventId"]
                 requests_.append({"updateCells": {"range": {"sheetId": target["sheet_id"], "startRowIndex": target["row"],
                     "endRowIndex": target["row"] + 1, "startColumnIndex": col, "endColumnIndex": col + 1},
@@ -443,10 +479,72 @@ class CalendarMonitor:
                 self._assert_owner(sheets)
                 sheets.write(requests_)
             verified = scan(self._read_monitor(sheets))
+            if verified["issues"]:
+                raise ValueError("事件 ID 回讀發現刀表結構衝突；監控已保留事件綁定。")
             indexed = {p["uid"]: p for p in verified["patients"]}
-            if verified["issues"] or any(not indexed.get(item["uid"]) or indexed[item["uid"]]["event_id"] != eid
-                    or indexed[item["uid"]]["identity"] != item["identity"] for item, eid in batch):
-                raise ValueError("事件 ID 回讀不一致，請先核對刀表；監控已保留事件綁定。")
+            for item, eid in valid:
+                target = indexed.get(item["uid"])
+                if not target or target["event_id"] != eid or target["identity"] != item["identity"]:
+                    issues.append(row_issue(target or item, "事件 ID 回讀不一致；監控已保留事件綁定。"))
+                else:
+                    succeeded.add(item["uid"])
+        return succeeded, issues
+
+    def _sync_item(self, sheets, calendar, item, config, now):
+        old = self.store.get("event", item["uid"])
+        eid = self._binding(item, old, config)
+        try:
+            expected = resource(item, config["spreadsheet_id"])
+        except ValueError as exc:
+            raise RowSyncError(str(exc)) from exc
+        if expected is None:
+            if old or item["event_id"]:
+                raise RowSyncError("已綁定追蹤列清空日期，請人工確認；事件保留。")
+            return None, None, 0
+        pending = {"uid": item["uid"], "identity": item["identity"], "event_id": eid,
+            "patient": {"mrn": item["mrn"], "name": item["name"]},
+            "sheet_id": item["sheet_id"], "hash": digest(expected), "resource": expected,
+            "status": "pending", "missing": 0, "updated_at": now}
+        if old and old.get("legacy_event_id"):
+            pending["legacy_event_id"] = old["legacy_event_id"]
+        self.store.save("event", item["uid"], pending)
+        actual = calendar.get(eid)
+        if not schedule_in_calendar_range(item, self.today()) and actual is None:
+            self.store.save("event", item["uid"], {**pending, "status": "historical"})
+            return None, None, 0
+        if "@" in eid and not actual:
+            raise RowSyncError("刀表的舊 iCalUID 查無事件，請人工核對；未建立另一事件。")
+        if actual and "@" in eid:
+            pending["legacy_event_id"] = eid
+            eid = actual["id"]
+            pending["event_id"] = eid
+            self.store.save("event", item["uid"], pending)
+        private = (actual or {}).get("extendedProperties", {}).get("private", {})
+        if actual and private.get("vghksSyncId") and private["vghksSyncId"] != item["uid"]:
+            raise RowSyncError("日曆事件已綁定另一筆排程，未覆寫。")
+        if actual and private.get("vghksSource") and private["vghksSource"] != config["spreadsheet_id"]:
+            raise RowSyncError("日曆事件屬於另一份刀表，未覆寫。")
+        if actual and not item["event_id"] and not private.get("vghksSyncId"):
+            raise RowSyncError("固定日曆 ID 已被未識別事件使用，未覆寫。")
+        if (actual and not private.get("vghksSyncId")
+                and norm(actual.get("summary", "").split(" | ")[0]) != norm(item["mrn"])):
+            raise RowSyncError("既有日曆事件的病歷號與刀表不同，請先核對綁定。")
+        updated = 0
+        if not matches(actual, expected):
+            self._assert_owner(sheets)
+            response = calendar.update(eid, expected) if actual else calendar.insert(eid, expected)
+            if response is None:
+                raise RowSyncError("日曆事件未能寫入，將於下一輪核對。")
+            if not matches(calendar.get(eid), expected):
+                raise RowSyncError("日曆事件回讀與刀表預期不符，已保留待核對狀態。")
+            updated = 1
+        binding = (item, eid) if item["event_id"] != eid else None
+        return binding, {**pending, "event_id": eid, "status": "ready"}, updated
+
+    def _reset_missing(self):
+        for old in self.store.all("event"):
+            if old.get("missing"):
+                self.store.save("event", old["uid"], {**old, "missing": 0})
 
     def run_once(self):
         with self.state_lock:
@@ -454,11 +552,12 @@ class CalendarMonitor:
         if not self.busy.acquire(blocking=False):
             return {"ok": False, "busy": True}
         updated = deleted = past_skipped = protected_past = 0
+        row_issues = []
         now = timestamp()
         started = time.monotonic()
         self.active_epoch = epoch
         config, result, metrics, sheets, calendar = {}, {"ok": False, "at": now}, {}, None, None
-        self._status(running=True, message="正在讀取並核對刀表…", issues=[])
+        self._status(running=True, message="正在讀取並核對刀表…", issues=[], row_issues=[], partial=False, failed_rows=0)
         try:
             config = self.store.get("config", "settings")
             self._checkpoint()
@@ -481,104 +580,92 @@ class CalendarMonitor:
                 # Presence anywhere protects an existing event, even if the
                 # row's type changed and it is no longer an eligible patient.
                 active = snapshot["identities"]
+                row_issues = self._validate_bindings(book, snapshot)
+                quarantined = {issue["uid"] for issue in row_issues}
                 bindings, completed = [], []
                 for item in snapshot["patients"]:
                     self._checkpoint()
+                    if item["uid"] in quarantined:
+                        continue
                     old = self.store.get("event", item["uid"])
                     if item["date"] and not schedule_requires_reconciliation(item, self.today(), old):
                         past_skipped += 1
                         continue
-                    eid = self._binding(item, old, config)
-                    expected = resource(item, config["spreadsheet_id"])
-                    if expected is None:
-                        if old or item["event_id"]:
-                            raise ValueError(item["sheet"] + " 已綁定追蹤列清空日期，請人工確認；事件保留。")
+                    try:
+                        binding, ready, changed = self._sync_item(sheets, calendar, item, config, now)
+                    except RowSyncError as exc:
+                        row_issues.append(row_issue(item, exc))
                         continue
-                    pending = {"uid": item["uid"], "identity": item["identity"], "event_id": eid,
-                        "sheet_id": item["sheet_id"], "hash": digest(expected), "resource": expected,
-                        "status": "pending", "missing": 0, "updated_at": now}
-                    if old and old.get("legacy_event_id"):
-                        pending["legacy_event_id"] = old["legacy_event_id"]
-                    self.store.save("event", item["uid"], pending)
-                    actual = calendar.get(eid)
-                    # Finish an in-flight move into the past, but never create
-                    # a past event if the original no longer exists.
-                    if not schedule_in_calendar_range(item, self.today()) and actual is None:
-                        self.store.save("event", item["uid"], {**pending, "status": "historical"})
+                    except CalendarError as exc:
+                        # Transport, quota, authorization and uncertain mutations
+                        # affect the whole connection. Only explicit rejections
+                        # of one event's data are isolated.
+                        if exc.code != "row_rejected":
+                            raise
+                        row_issues.append(row_issue(item, exc, "row_rejected"))
                         continue
-                    if "@" in eid and not actual:
-                        raise ValueError("刀表的舊 iCalUID 查無事件，請人工核對；未以舊格式建立另一事件。")
-                    if actual and "@" in eid:
-                        pending["legacy_event_id"] = eid
-                        eid = actual["id"]
-                        pending["event_id"] = eid
-                        self.store.save("event", item["uid"], pending)
-                    private = (actual or {}).get("extendedProperties", {}).get("private", {})
-                    if actual and private.get("vghksSyncId") and private["vghksSyncId"] != item["uid"]:
-                        raise ValueError("日曆事件已綁定另一筆排程，未覆寫。")
-                    if actual and private.get("vghksSource") and private["vghksSource"] != config["spreadsheet_id"]:
-                        raise ValueError("日曆事件屬於另一份刀表，未覆寫。")
-                    if actual and not item["event_id"] and not private.get("vghksSyncId"):
-                        raise ValueError("固定日曆 ID 已被未識別事件使用，未覆寫。")
-                    if actual and not private.get("vghksSyncId") and norm(actual.get("summary", "").split(" | ")[0]) != norm(item["mrn"]):
-                        raise ValueError("既有日曆事件的病歷號與刀表不同，請先核對綁定。")
-                    if not matches(actual, expected):
-                        self._assert_owner(sheets)
-                        result = calendar.update(eid, expected) if actual else calendar.insert(eid, expected)
-                        if result is None:
-                            raise CalendarError("日曆事件未能寫入，將於下一輪核對。")
-                        if not matches(calendar.get(eid), expected):
-                            raise CalendarError("日曆事件回讀與刀表預期不符，已保留待核對狀態。")
-                        updated += 1
-                    if item["event_id"] != eid:
-                        bindings.append((item, eid))
-                    completed.append((item["uid"], {**pending, "event_id": eid, "status": "ready"}))
-                self._write_bindings(sheets, bindings)
-                # Keep pending state until both Calendar and sheet bindings are
-                # verified, so a failed binding write can resume even in the past.
+                    updated += changed
+                    if binding:
+                        bindings.append(binding)
+                    if ready:
+                        completed.append((item["uid"], ready))
+                        if not binding:
+                            self.store.save("event", item["uid"], ready)
+                verified, binding_issues = self._write_bindings(sheets, bindings)
+                row_issues.extend(binding_issues)
+                needs_binding = {item["uid"] for item, _ in bindings}
                 for uid, ready in completed:
-                    self.store.save("event", uid, ready)
+                    if uid not in needs_binding or uid in verified:
+                        self.store.save("event", uid, ready)
                 self._checkpoint()
                 # Re-read the complete workbook before considering any disappearance.
-                final = scan(self._read_monitor(sheets), config["include_fu"])
+                final_book = self._read_monitor(sheets)
+                final = scan(final_book, config["include_fu"])
                 if final["issues"] or final["identities"] != snapshot["identities"]:
                     raise ValueError("同步期間刀表結構或識別有變動，本輪不刪除事件。")
-                for old in self.store.all("event"):
-                    self._checkpoint()
-                    if old.get("frozen_past") or not in_calendar_range(old.get("resource"), self.today()):
-                        continue
-                    if old["uid"] in active:
-                        if old.get("missing"):
-                            self.store.save("event", old["uid"], {**old, "missing": 0})
-                        continue
-                    if old.get("status") == "deleted":
-                        continue
-                    prior = old.get("missing", 0) if self.last_scan_ok else 0
-                    count = prior + 1 if deletion_safe and old["sheet_id"] in final["sheet_ids"] else 0
-                    self.store.save("event", old["uid"], {**old, "missing": count})
-                    if count < 2:
-                        continue
-                    actual = calendar.get(old["event_id"])
-                    if actual and not in_calendar_range(actual, self.today()):
-                        self.store.save("event", old["uid"], {**old, "resource": actual,
-                            "status": "historical", "frozen_past": True, "missing": 0})
-                        protected_past += 1
-                        continue
-                    private = (actual or {}).get("extendedProperties", {}).get("private", {})
-                    if actual and (private.get("vghksSyncId") != old["uid"] or private.get("vghksSource") != config["spreadsheet_id"]):
-                        raise ValueError("待刪事件無法確認擁有權，保留並要求人工核對。")
-                    self.store.save("event", old["uid"], {**old, "missing": count, "status": "deleting"})
-                    if (not in_calendar_range(old["resource"], self.today())
-                            or actual and not in_calendar_range(actual, self.today())):
-                        continue
-                    self._assert_owner(sheets)
-                    calendar.delete(old["event_id"])
-                    if calendar.get(old["event_id"]) is not None:
-                        raise CalendarError("刪除事件尚未確認，下輪會先核對。")
-                    self.store.save("event", old["uid"], {**old, "missing": count, "status": "deleted"})
-                    deleted += 1
-                self.store.save("scan", "last", {"sheet_ids": sorted(snapshot["sheet_ids"]), "at": now})
-            result = {"ok": True, "updated": updated, "deleted": deleted, "at": now,
+                final_row_issues = self._validate_bindings(final_book, final)
+                known = {issue["uid"] for issue in row_issues}
+                row_issues.extend(issue for issue in final_row_issues if issue["uid"] not in known)
+                if row_issues:
+                    self._reset_missing()
+                else:
+                    for old in self.store.all("event"):
+                        self._checkpoint()
+                        if old.get("frozen_past") or not in_calendar_range(old.get("resource"), self.today()):
+                            continue
+                        if old["uid"] in active:
+                            if old.get("missing"):
+                                self.store.save("event", old["uid"], {**old, "missing": 0})
+                            continue
+                        if old.get("status") == "deleted":
+                            continue
+                        prior = old.get("missing", 0) if self.last_scan_ok else 0
+                        count = prior + 1 if deletion_safe and old["sheet_id"] in final["sheet_ids"] else 0
+                        self.store.save("event", old["uid"], {**old, "missing": count})
+                        if count < 2:
+                            continue
+                        actual = calendar.get(old["event_id"])
+                        if actual and not in_calendar_range(actual, self.today()):
+                            self.store.save("event", old["uid"], {**old, "resource": actual,
+                                "status": "historical", "frozen_past": True, "missing": 0})
+                            protected_past += 1
+                            continue
+                        private = (actual or {}).get("extendedProperties", {}).get("private", {})
+                        if actual and (private.get("vghksSyncId") != old["uid"] or private.get("vghksSource") != config["spreadsheet_id"]):
+                            raise ValueError("待刪事件無法確認擁有權，保留並要求人工核對。")
+                        self.store.save("event", old["uid"], {**old, "missing": count, "status": "deleting"})
+                        if (not in_calendar_range(old["resource"], self.today())
+                                or actual and not in_calendar_range(actual, self.today())):
+                            continue
+                        self._assert_owner(sheets)
+                        calendar.delete(old["event_id"])
+                        if calendar.get(old["event_id"]) is not None:
+                            raise CalendarError("刪除事件尚未確認，下輪會先核對。")
+                        self.store.save("event", old["uid"], {**old, "missing": count, "status": "deleted"})
+                        deleted += 1
+                    self.store.save("scan", "last", {"sheet_ids": sorted(snapshot["sheet_ids"]), "at": now})
+            result = {"ok": not row_issues, "partial": bool(row_issues), "row_issues": row_issues,
+                      "failed_rows": len(row_issues), "updated": updated, "deleted": deleted, "at": now,
                       "scope_from": self.today().isoformat(), "past_skipped": past_skipped,
                       "protected_past": protected_past,
                       "message": f"同步完成：更新 {updated} 筆，刪除 {deleted} 筆。"}
@@ -586,23 +673,26 @@ class CalendarMonitor:
                 result["message"] += f"略過過去排程 {past_skipped} 筆。"
             if protected_past:
                 result["message"] += f"保留已無排程且已過去或日期不明的事件 {protected_past} 筆。"
-            self._status(**{k: result[k] for k in ("updated", "deleted", "message")}, issues=[])
-            self.last_scan_ok = True
+            if row_issues:
+                result["failure_code"] = "row_issues"
+                result["message"] = f"部分完成：更新 {updated} 筆，{len(row_issues)} 列待核對；本輪不刪除事件。"
+            self._status(**{k: result[k] for k in ("updated", "deleted", "message", "partial", "row_issues", "failed_rows")}, issues=[])
+            self.last_scan_ok = not row_issues
         except Exception as exc:
             self.last_scan_ok = False
             message = str(exc) if isinstance(exc, (ValueError, CalendarError, SheetError)) else "同步未完成，已保存待核對狀態；請檢查網路與設定。"
             result = {"ok": False, "at": now, "message": message, "updated": updated, "deleted": deleted,
-                      "failure_code": getattr(exc, "code", "") or "conflict", "retryable": bool(getattr(exc, "retryable", False))}
-            self._status(message=message, issues=[message], updated=updated, deleted=deleted)
+                      "failure_code": getattr(exc, "code", "") or "conflict", "retryable": bool(getattr(exc, "retryable", False)),
+                      "partial": False, "row_issues": row_issues, "failed_rows": len(row_issues)}
+            self._status(message=message, issues=[message], updated=updated, deleted=deleted, partial=False,
+                         row_issues=row_issues, failed_rows=len(row_issues))
             if result["failure_code"] == "host_conflict":
                 config = self.store.get("config", "settings")
                 config["enabled"] = False
                 self.store.save("config", "settings", config)
                 self._status(host_state="conflict")
             # Errors break consecutive-success deletion confirmation.
-            for old in self.store.all("event"):
-                if old.get("missing"):
-                    self.store.save("event", old["uid"], {**old, "missing": 0})
+            self._reset_missing()
         finally:
             try:
                 metrics = {label: {"requests": client.http.requests, "retries": client.http.retries}

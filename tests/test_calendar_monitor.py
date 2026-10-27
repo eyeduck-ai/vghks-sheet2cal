@@ -189,6 +189,7 @@ class MonitorTests(unittest.TestCase):
                 _, cols = headers(sheets.book["sheets"][0])
                 target = sheets.book["sheets"][0]["rows"][2]
                 target[cols["病歷號"]] = cell("00999")
+                target[cols["姓名"]] = cell("另一位合成患者")
                 target[cols["醫院"]] = cell("聯醫")
                 before = len(sheets.writes)
                 self.assertFalse(monitor.run_once()["ok"])
@@ -210,10 +211,14 @@ class MonitorTests(unittest.TestCase):
                                       today=lambda: date(2026, 10, 1))
             try:
                 monitor.configure({"spreadsheet_id": "synthetic-spreadsheet-00000000000", "calendar_id": "synthetic-calendar"})
-                with self.assertRaisesRegex(ValueError, "原病歷號綁定不符"):
-                    monitor.prepare()
-                self.assertEqual(sheets.writes, [])
-                self.assertEqual(calendar.inserts, 0)
+                monitor.prepare()
+                preview = monitor.inspect()
+                self.assertFalse(preview["ok"])
+                self.assertIn("原病歷號綁定不符", preview["row_issues"][0]["message"])
+                result = monitor.run_once()
+                self.assertTrue(result["partial"])
+                self.assertEqual(calendar.inserts, 1)  # The independent healthy row still syncs.
+                self.assertEqual(scan(sheets.book)["patients"][0]["event_id"], "")
                 self.assertEqual(sheets.book["sheets"][-1], state)
             finally:
                 monitor.close()
@@ -271,9 +276,10 @@ class MonitorTests(unittest.TestCase):
                 self.assertTrue(monitor.run_once()["ok"])
                 _, cols = headers(sheets.book["sheets"][0])
                 sheets.book["sheets"][0]["rows"][2][cols["病歷號"]] = cell("00999")
+                sheets.book["sheets"][0]["rows"][2][cols["姓名"]] = cell("另一位合成患者")
                 result = monitor.run_once()
                 self.assertFalse(result["ok"])
-                self.assertIn("病人已變更", result["message"])
+                self.assertIn("病人已變更", result["row_issues"][0]["message"])
                 self.assertEqual(calendar.updates, 0)
                 self.assertEqual(calendar.deletes, 0)
             finally:
@@ -383,7 +389,7 @@ class MonitorTests(unittest.TestCase):
                     calendar.events["legacydifferent"] = {"id": "legacydifferent",
                         "start": {"date": "2026-10-12"}, "summary": event_mrn + " | 合成甲 | Old"}
                     self.assertFalse(monitor.run_once()["ok"])
-                    self.assertEqual((calendar.inserts, calendar.updates, calendar.deletes), (0, 0, 0))
+                    self.assertEqual((calendar.inserts, calendar.updates, calendar.deletes), (1, 0, 0))
                 finally:
                     monitor.close()
 

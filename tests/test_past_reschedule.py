@@ -207,6 +207,7 @@ class PastRescheduleTests(unittest.TestCase):
                 before = copy.deepcopy(calendar.events)
                 _, cols = headers(sheets.book["sheets"][0])
                 sheets.book["sheets"][0]["rows"][2][cols["病歷號"]] = cell("00999")
+                sheets.book["sheets"][0]["rows"][2][cols["姓名"]] = cell("另一位合成患者")
                 target[col] = cell("2026-10-18")
                 with patch.object(calendar, "get", wraps=calendar.get) as get:
                     result = monitor.run_once()

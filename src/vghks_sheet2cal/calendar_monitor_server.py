@@ -26,9 +26,12 @@ def health(application):
     configured = application.store.configured() and config.get("setup_done", False)
     enabled = config.get("enabled", False)
     alive = application.thread.is_alive()
-    ready = bool(configured and enabled and alive and age is not None and age <= config["hours"] * 3600 * 2 + 300)
+    partial = bool(application.status.get("partial"))
+    ready = bool(configured and enabled and alive and not partial
+                 and age is not None and age <= config["hours"] * 3600 * 2 + 300)
     return {"alive": alive, "configured": configured, "enabled": enabled, "ready": ready,
-            "state": "setup_required" if not configured else "paused" if not enabled else "ready" if ready else "awaiting_success",
+            "state": "setup_required" if not configured else "paused" if not enabled else "partial" if partial else "ready" if ready else "awaiting_success",
+            "partial": partial, "failed_rows": application.status.get("failed_rows", 0),
             "last_success": last, "last_success_age_seconds": round(age) if age is not None else None,
             "consecutive_failures": config.get("consecutive_failures", 0), "contract_version": CONTRACT_VERSION}
 

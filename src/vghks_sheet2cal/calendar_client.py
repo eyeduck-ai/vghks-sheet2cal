@@ -50,7 +50,8 @@ class CalendarClient:
             error = CalendarUncertain if method != "GET" else CalendarError
             raise error("Google 日曆暫時無法完成請求；稍後會核對並重試。", code="transient", retryable=True)
         if not response.ok:
-            raise CalendarError("Google 日曆拒絕操作；請檢查日曆 ID、事件資料與權限。")
+            raise CalendarError("Google 日曆拒絕這筆事件資料；原綁定保留，請核對日期與內容。",
+                                code="row_rejected" if response.status_code in {400, 422} else "rejected")
         if response.status_code == 204:
             return {}
         try:
@@ -70,7 +71,7 @@ class CalendarClient:
             result = self.request("GET", "/events", params={"iCalUID": event_id, "maxResults": 10})
             matches = [e for e in (result or {}).get("items", []) if e.get("status") != "cancelled"]
             if len(matches) > 1:
-                raise CalendarError("舊 iCalUID 對應多個日曆事件，請人工核對。")
+                raise CalendarError("舊 iCalUID 對應多個日曆事件，請人工核對。", code="row_rejected")
             return matches[0] if matches else None
         result = self.request("GET", "/events/" + quote(event_id, safe=""))
         return None if result and result.get("status") == "cancelled" else result

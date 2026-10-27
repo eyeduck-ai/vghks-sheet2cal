@@ -58,6 +58,10 @@ bash scripts/deploy.sh
 
 也可執行 `.runtime/service-venv/bin/vghks-sheet2cal open-ui`，在本機狀態頁匯入 JSON、檢查、準備及啟用。入口 token 每次服務啟動都會更換。
 
+病歷號可在改院區時暫空，再填新院區病歷號；已綁定排程只要非空病歷號或姓名仍一致，就沿用原 `ScheduleSyncId` 與 `CalendarEventId`。日曆呈現刀表目前的值，不回填舊病歷號。姓名與病歷號都變成另一人、事件綁定不符、單列日期或事件資料有誤時，只保留該列待核對，其餘列繼續同步。首次綁定仍核對主程式病歷號基準。
+
+狀態頁會顯示「部分完成」與問題分頁、列號；有列未完成的整輪不刪除任何事件，並重設刪除確認次數，恢復後須連續兩輪完整成功才可刪除。重複或孤立 ID、刀日結構不明、主機衝突及連線／授權問題仍停止整輪。
+
 ## 維運
 
 ```bash
@@ -71,7 +75,7 @@ systemctl --user restart vghks-sheet2cal.service
 
 `run-once` 立即排入單輪同步；稍後用 `status` 或狀態頁查看完成結果。`pause` 會持久保存停用設定；systemd 重啟不會自行解除暫停。停止服務時在操作安全邊界保存狀態，重啟後續接既有事件。
 
-`/healthz` 表示服務存活；`/readyz` 只有在已設定、啟用且最近兩個週期內有成功同步時回覆 200。無設定時健康狀態為 `setup_required`。日誌省略憑證、入口 token 與病人資料，詳細問題顯示在已驗證的本機狀態頁。
+`/healthz` 表示服務存活；`/readyz` 只有在已設定、啟用且最近兩個週期內有完整成功同步且目前沒有部分完成問題時回覆 200。無設定時健康狀態為 `setup_required`。日誌省略憑證、入口 token 與病人資料，詳細問題顯示在已驗證的本機狀態頁。
 
 更新程式後再次執行 `bash scripts/deploy.sh`。更新不重建狀態資料庫；備份及搬移請保留完整狀態目錄，並在複製前停止服務。尚未完成的操作不能僅從刀表重建。
 
@@ -83,7 +87,7 @@ systemctl --user restart vghks-sheet2cal.service
 
 ## 共用規格與相容性
 
-契約版本 **1.2.2**。正式來源位於 [op_spreadsheet 的刀表契約](https://github.com/eyeduck-ai/op_spreadsheet/tree/master/contracts)，Python 共用套件位於同 repo 的 `packages/python`。本專案依賴固定的完整 Git commit；`compatibility.json` 記錄已驗證的搭配版本。一般更新不會在背景下載規格。
+契約版本 **1.3.0**。正式來源位於 [op_spreadsheet 的刀表契約](https://github.com/eyeduck-ai/op_spreadsheet/tree/master/contracts)，Python 共用套件位於同 repo 的 `packages/python`。本專案依賴固定的完整 Git commit；`compatibility.json` 記錄已驗證的搭配版本。一般更新不會在背景下載規格。
 
 主程式與此監控使用同一份 `vghks-sheet-core` 欄位解析、永久識別、共享基準與日曆呈現。GAS 使用生成的欄位定義，並以真實 GAS 匯出案例驗證解析及操作語意。更新步驟見該 repo 的 `docs/SHEET_CONTRACT.md`。
 
