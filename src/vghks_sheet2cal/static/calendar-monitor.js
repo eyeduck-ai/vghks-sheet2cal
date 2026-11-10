@@ -2,9 +2,16 @@
 const byId = id => document.getElementById(id);
 let csrf = "", dirty = false, working = false, lastAttempt, preflightRows;
 function notice(message) { const el = byId("notice"); el.textContent = message; el.classList.toggle("visible", Boolean(message)); }
+function globalFailure(item) {
+  return !item.partial && item.failure_code !== "paused" && Boolean(item.health?.state === "blocked" || item.failure_code || item.consecutive_failures || item.ok === false);
+}
 function cycleCounts(item) {
   const failed = item.failed_rows ?? (item.row_issues || []).length;
-  return `更新 ${item.updated || 0} 筆、刪除 ${item.deleted || 0} 筆、需核對 ${failed} 列`;
+  const counts = `更新 ${item.updated || 0} 筆、刪除 ${item.deleted || 0} 筆`;
+  return globalFailure(item) ? `本輪未完成 · ${counts}${failed ? `、需核對 ${failed} 列` : ""}` : `${counts}、需核對 ${failed} 列`;
+}
+function elapsed(seconds) {
+  return seconds >= 86400 ? `${Math.floor(seconds / 86400)} 天` : seconds >= 3600 ? `${Math.floor(seconds / 3600)} 小時` : seconds >= 60 ? `${Math.floor(seconds / 60)} 分鐘` : "不到 1 分鐘";
 }
 function paintRowIssues(issues = []) {
   byId("row-issues-panel").hidden = issues.length === 0;
@@ -21,10 +28,16 @@ async function request(path, values) {
 function paint(data) {
   lastAttempt = data.last_attempt;
   if (preflightRows && preflightRows.last_attempt !== lastAttempt) preflightRows = undefined;
-  const state = (data.running ? "同步執行中 · " : data.enabled ? "定時監控已啟用 · " : "定時監控停用 · ") + data.message;
+  const health = data.health || {state: data.partial ? "partial" : globalFailure(data) ? "blocked" : data.last_success ? "ready" : "awaiting_success"};
+  const label = ({blocked: "同步受阻", partial: "部分完成，仍有資料待核對", awaiting_success: "等待成功同步", setup_required: "待完成設定", paused: "已暫停", ready: "同步正常"})[health.state] || "等待成功同步";
+  const state = `${label} · ${data.enabled ? "定時監控已啟用" : "定時監控停用"} · ${data.running ? "同步執行中 · " : ""}${data.message}`;
   if (byId("state").textContent !== state) byId("state").textContent = state;
+  byId("state").classList.toggle("blocked", health.state === "blocked");
+  byId("state").classList.toggle("warning", ["partial", "awaiting_success", "setup_required"].includes(health.state));
   byId("last").textContent = data.last_attempt || "尚未執行"; byId("next").textContent = data.enabled ? data.next_check || "即將執行" : "停用";
-  byId("success").textContent = data.last_success || "尚未成功同步";
+  const age = health.last_success_age_seconds;
+  const ageText = age == null ? "" : health.stale ? `（已 ${elapsed(age)}未成功同步；檢查門檻 ${Math.round(health.success_max_age_seconds / 60)} 分鐘）` : `（距今 ${elapsed(age)}）`;
+  byId("success").textContent = (data.last_success || "尚未成功同步") + ageText;
   byId("duration").textContent = data.duration_seconds === undefined ? "—" : data.duration_seconds + " 秒";
   byId("counts").textContent = data.last_attempt ? cycleCounts(data) : "尚未執行";
   byId("failures").textContent = String(data.consecutive_failures || 0);
@@ -32,7 +45,7 @@ function paint(data) {
   byId("host").textContent = ({registered: "已登記本機 · 單一主機同步", conflict: "主機登記衝突 · 已停止同步", unregistered: "尚未登記"})[data.host_state] || "待核對";
   byId("email").textContent = data.email || "尚未匯入"; byId("directory").textContent = data.data_dir;
   if (!dirty) { byId("spreadsheet").value = data.spreadsheet_id; byId("calendar").value = data.calendar_id; byId("hours").value = data.hours; byId("fu").checked = data.include_fu; byId("enabled").checked = data.enabled; }
-  byId("history").replaceChildren(...data.history.map(item => { const li = document.createElement("li"); li.textContent = `${item.partial ? "部分完成" : item.ok ? "完成" : item.failure_code === "paused" ? "已暫停" : "需核對"} · ${item.message}（${cycleCounts(item)}）`; return li; }));
+  byId("history").replaceChildren(...data.history.map(item => { const li = document.createElement("li"); li.textContent = `${item.partial ? "部分完成" : item.ok ? "完成" : item.failure_code === "paused" ? "已暫停" : "未完成"} · ${item.message}（${cycleCounts(item)}）`; return li; }));
   paintRowIssues(preflightRows ? preflightRows.issues : data.row_issues);
   byId("run").disabled = working || data.running || !data.setup_done; byId("prepare").disabled = working || data.running;
 }
