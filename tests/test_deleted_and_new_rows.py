@@ -247,7 +247,7 @@ class DeletedAndNewRowsTests(unittest.TestCase):
                 finally:
                     monitor.close()
 
-    def test_orphan_visible_only_move_and_duplicate_ids_still_block_every_calendar_mutation(self):
+    def test_orphan_or_duplicate_ids_hold_related_rows_while_healthy_row_updates(self):
         for kind in ("MONTHLY", "FU"):
             for conflict in ("orphan", "duplicate_uid", "duplicate_event"):
                 with self.subTest(kind=kind, conflict=conflict), tempfile.TemporaryDirectory() as directory:
@@ -256,6 +256,7 @@ class DeletedAndNewRowsTests(unittest.TestCase):
                     try:
                         self.assertTrue(monitor.run_once()["ok"])
                         original, sheet, source = locate(sheets, REMOVED_UID)
+                        bad_event = copy.deepcopy(calendar.events[original["event_id"]])
                         copied = copy.deepcopy(source)
                         uid_col, eid_col = original["cols"]["ScheduleSyncId"], original["cols"]["CalendarEventId"]
                         if conflict == "orphan":
@@ -270,14 +271,20 @@ class DeletedAndNewRowsTests(unittest.TestCase):
                         sheet["rows"].append(copied)
                         healthy, _, healthy_cells = locate(sheets, HEALTHY_UID)
                         healthy_cells[healthy["cols"]["Plan"]] = cell("合成正常更新")
-                        events = copy.deepcopy(calendar.events)
                         clinical = clinical_projection(sheets.book)
                         with patch.object(calendar, "get", wraps=calendar.get) as get:
                             self.assertFalse(monitor.inspect()["ok"])
-                            self.assertFalse(monitor.run_once()["ok"])
-                        self.assertEqual(get.call_count, 0)
-                        self.assertEqual(calendar.events, events)
-                        self.assertEqual((calendar.inserts, calendar.updates, calendar.deletes), (2, 0, 0))
+                            result = monitor.run_once()
+                        self.assertFalse(result["ok"], result)
+                        self.assertTrue(result["partial"], result)
+                        self.assertTrue(result["row_issues"])
+                        requested = [call.args[0] for call in get.call_args_list]
+                        self.assertIn(healthy["event_id"], requested)
+                        self.assertNotIn(original["event_id"], requested)
+                        self.assertEqual(calendar.events[original["event_id"]], bad_event)
+                        self.assertIn("Plan: 合成正常更新", calendar.events[healthy["event_id"]]["description"])
+                        self.assertEqual(set(calendar.events), {original["event_id"], healthy["event_id"]})
+                        self.assertEqual((calendar.inserts, calendar.updates, calendar.deletes), (2, 1, 0))
                         self.assertEqual(clinical_projection(sheets.book), clinical)
                     finally:
                         monitor.close()

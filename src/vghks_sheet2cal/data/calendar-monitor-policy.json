@@ -1,0 +1,79 @@
+{
+  "policy_version": "1.4.0",
+  "schema_contract_version": "1.3.0",
+  "applies_to": "vghks-sheet2cal",
+  "timezone": "Asia/Taipei",
+  "precedence": {
+    "base_contract": "sheet-contract.json",
+    "overrides": ["rules.identity"],
+    "scope": "Calendar monitor execution only: bounded identity conflicts are quarantined before calling the unchanged strict shared parser and planners.",
+    "strict_consumers": "Shared core, main clinical program and GAS writers retain fail-closed duplicate/orphan identity diagnostics. This policy changes no sheet fields, identity format, clinical MRN checks or generated core/GAS data."
+  },
+  "identity": {
+    "tracking": ["ScheduleSyncId", "CalendarEventId"],
+    "manual_add": "Allocate missing technical IDs automatically only when the source row is unambiguous; preserve all clinical cells and formulas.",
+    "whole_row_move": "A native whole-row move carries both IDs and updates the original Calendar event, including moves between day blocks, campuses or supported tabs with compatible headers and column layout.",
+    "delete_and_retype": "A fully deleted row followed by a newly typed row is a new schedule with new IDs, even for the same patient. Retire the old event under the normal missing-row rules.",
+    "no_inferred_pairing": "Never recover or merge deleted/new rows by name, MRN, date or clinical-field similarity. A missing CalendarEventId on an otherwise verified existing UID may be restored from that UID's trusted local binding.",
+    "patient_anchor": "After stable schedule/event binding checks, an equal normalized nonblank MRN or name in the trusted previous patient is sufficient. Missing or changed campus MRNs remain source values and are never backfilled; neither anchor matching quarantines the row."
+  },
+  "source_safety": {
+    "global_halt": [
+      "duplicate_or_missing_required_headers",
+      "malformed_day_structure_or_missing_day_context",
+      "invalid_shared_clinical_baseline",
+      "host_registration_conflict",
+      "active_archive_lock",
+      "shared_transport_or_authorization_failure"
+    ],
+    "bounded_conflicts": [
+      "invalid_or_formula_identity",
+      "duplicate_schedule_or_calendar_event_id",
+      "orphan_schedule_or_calendar_event_id",
+      "bound_patient_id_reused_as_day_header",
+      "invalid_fu_date_or_cleared_bound_date",
+      "patient_or_event_binding_conflict",
+      "row_specific_event_rejection_or_concurrent_event_change"
+    ],
+    "conflict_group": "Quarantine every row linked by a conflicting UID or CalendarEventId; a conflicting day header quarantines its full day block. Never choose a first-row winner.",
+    "orphan_destinations": "While orphan system IDs exist, also quarantine unidentified patient rows that could be move destinations; do not allocate replacement identities by guessing.",
+    "projection": "Mask bounded conflict rows only in a private in-memory planner view, preserving physical row positions and manual layout footprint. Never upload that projection, clear conflicting source cells or apply planned cell writes intersecting quarantined rows.",
+    "partial_cycle": "Healthy rows continue. Any quarantined row or reconciliation failure disables all remaining deletions and resets every missing-row confirmation. Already verified operations remain recorded; cross-event operations are not atomic.",
+    "diagnostics": "Report sheet, one-based row, reason and safe field names without patient names, MRNs, raw invalid IDs or clinical values."
+  },
+  "calendar": {
+    "interval_seconds": 3600,
+    "scope": "Reconcile schedules dated today or later in Asia/Taipei; scan all supported tabs and identities for safety. Include FU; FU takes precedence over All. Undated new FU and day headers have no event.",
+    "past_to_current": "When the current source date returns to today/future, resume the original bound event regardless of an old cached past date or protection marker.",
+    "current_to_past": "Update the original existing event once, verify Calendar and persist confirmation before skipping it. Never create a missing past event. Naturally elapsed confirmed past schedules require no per-event Calendar requests.",
+    "desired_state": "Persist the source-derived desired_resource separately from resource, which represents the most recently confirmed Calendar state; never use an unconfirmed desired date to declare an event historical.",
+    "confirmation": "Save a successfully verified Calendar resource immediately, even if writing CalendarEventId back to Sheets is still pending. Ready state additionally requires the source binding to be verified.",
+    "legacy_pending": "Older pending records without desired_resource have an untrusted resource. GET the original event before past-skipping or retirement, including after restart and when its source row has disappeared.",
+    "pending_source_removed": "Do not replay an obsolete desired update after the row disappears. Resolve uncertain pending/deleting state by GET and use the actual owned Calendar event's date for preservation or retirement.",
+    "deletion_confirmation_cycles": 2,
+    "deletion_confirmation": "Require two consecutive complete successful Calendar reconciliation cycles with no quarantined rows, complete source identity protection and source-sheet presence. Read-only source observations never increment deletion confirmations; failures/partial cycles reset them, and restart requires fresh consecutive successes.",
+    "deletion_scope": "An ID present anywhere supported, including archives and quarantined source rows, protects its event. Preserve missing-source past or unparseable-date events. Delete only an owned event still dated today/future after final complete-source and owner checks.",
+    "conditional_writes": {
+      "update_and_delete_header": "If-Match",
+      "version_source": "The actual event ETag read from Calendar; production updates/deletes without an ETag are withheld for review.",
+      "delete_recheck": "Re-read the source before deletion and GET the event immediately before DELETE; verify source/UID ownership and actual date again, then condition DELETE on that ETag.",
+      "precondition_failed": "HTTP 412 preserves the concurrently changed event, triggers reconciliation in a later cycle, disables remaining deletions and resets confirmations.",
+      "insert": "Use the deterministic event ID; resolve collisions or uncertain responses by reading the original event, never by inserting a replacement ID."
+    }
+  },
+  "observation": {
+    "interval_seconds": 300,
+    "retention": {"observations": 200, "changes": 10000},
+    "storage": "Private local SQLite, scoped by source spreadsheet, with the latest raw snapshot and append-only row before/after changes until bounded retention expires.",
+    "capture": "Observe only complete workbook reads, before identity migration and after technical writes, including full reads with structural diagnostics or a partial Calendar cycle. Read failures do not replace the last complete snapshot.",
+    "row_facts": "Preserve entered/formula and effective/displayed cells, notes, strikethrough, physical location and resolved day/campus. Unique stable IDs anchor moves; duplicate/orphan diagnostics remain visible.",
+    "deduplication": "Unchanged snapshots reuse the revision. A blank-to-assigned UID at the same physical row with identical clinical cells/formulas and effective route is a technical modification, not a clinical identity match.",
+    "public_history": "Expose only bounded counts, revision/time, sheet/row, date/campus and changed field names; full clinical values remain private.",
+    "limits": "This is observed net change between reads, not every edit or an atomic Sheets change log. Observation performs no Calendar calls, ID allocation or deletion confirmation and never implies Calendar success."
+  },
+  "release": {
+    "core_and_schema": "Pin the compatible 1.3.0 core source independently; do not regenerate or rebuild main/GAS for this monitor-only policy update.",
+    "monitor_manifest": "Pin policy_version and its full policy_revision source commit separately from contract_version and gas_revision, which pin the shared schema/core.",
+    "runtime_updates": "Ship the reviewed policy with the monitor release; never download a latest policy during execution."
+  }
+}

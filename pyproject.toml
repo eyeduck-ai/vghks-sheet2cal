@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vghks-sheet2cal"
-version = "1.3.1"
+version = "1.4.0"
 description = "Independent persistent VGHKS surgery and FU calendar monitor"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -20,7 +20,7 @@ vghks-sheet2cal = "vghks_sheet2cal.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-vghks_sheet2cal = ["static/*"]
+vghks_sheet2cal = ["static/*", "data/*.json"]
 
 [tool.ruff]
 target-version = "py311"

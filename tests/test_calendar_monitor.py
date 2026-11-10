@@ -158,7 +158,8 @@ class MonitorTests(unittest.TestCase):
                 for _ in range(3):
                     result = monitor.run_once()
                     self.assertFalse(result["ok"])
-                    self.assertIn("變成刀日標題", result["message"])
+                    self.assertTrue(result["partial"], result)
+                    self.assertTrue(any("變成刀日標題" in issue["message"] for issue in result["row_issues"]), result)
                 self.assertEqual(len(sheets.writes), before)
                 self.assertEqual(calendar.deletes, 0)
                 self.assertEqual(calendar.updates, 0)
@@ -285,21 +286,32 @@ class MonitorTests(unittest.TestCase):
             finally:
                 monitor.close()
 
-    def test_visible_only_move_and_duplicate_ids_hold_events(self):
+    def test_visible_only_move_and_duplicate_ids_hold_related_event_but_not_healthy_update(self):
         for duplicate in (False, True):
             with self.subTest(duplicate=duplicate), tempfile.TemporaryDirectory() as directory:
                 monitor, sheets, calendar = prepared(directory)
                 try:
                     self.assertTrue(monitor.run_once()["ok"])
+                    patients = scan(sheets.book)["patients"]
+                    bad_event = copy.deepcopy(calendar.events[patients[0]["event_id"]])
                     source = sheets.book["sheets"][0]["rows"][2]
                     moved = copy.deepcopy(source)
                     if not duplicate:
                         moved[-2:] = [{}, {}]
                         source[:len(source) - 2] = [{} for _ in source[:-2]]
                     sheets.book["sheets"][0]["rows"].append(moved)
-                    self.assertFalse(monitor.run_once()["ok"])
-                    self.assertEqual(calendar.inserts, 2)
-                    self.assertEqual(calendar.deletes, 0)
+                    healthy = patients[1]
+                    sheets.book["sheets"][0]["rows"][healthy["row"]][healthy["cols"]["Plan"]] = cell("合成正常更新")
+                    with patch.object(calendar, "get", wraps=calendar.get) as get:
+                        result = monitor.run_once()
+                    self.assertFalse(result["ok"], result)
+                    self.assertTrue(result["partial"], result)
+                    requested = [call.args[0] for call in get.call_args_list]
+                    self.assertIn(healthy["event_id"], requested)
+                    self.assertNotIn(patients[0]["event_id"], requested)
+                    self.assertEqual(calendar.events[patients[0]["event_id"]], bad_event)
+                    self.assertIn("Plan: 合成正常更新", calendar.events[healthy["event_id"]]["description"])
+                    self.assertEqual((calendar.inserts, calendar.updates, calendar.deletes), (2, 1, 0))
                 finally:
                     monitor.close()
 
