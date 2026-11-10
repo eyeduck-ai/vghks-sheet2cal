@@ -26,11 +26,18 @@ function element() {
 const html = fs.readFileSync(staticDir + '/calendar-monitor.html', 'utf8');
 const ids = new Map([...html.matchAll(/\bid="([^"]+)"/g)]
   .map(match => [match[1], element()]));
+const timers = [];
+const requests = [];
+let resolveInitialFetch;
 const context = vm.createContext({
   document: {getElementById(id) { assert(ids.has(id), 'Missing HTML element ' + id); return ids.get(id); },
     createElement: element},
   location: {hash: ''}, sessionStorage: {getItem() { return ''; }},
-  fetch() { return new Promise(() => {}); }, setInterval() {}
+  fetch(path, options) {
+    requests.push({path, options});
+    return new Promise(resolve => { resolveInitialFetch = resolve; });
+  },
+  setInterval(callback, milliseconds) { timers.push({callback, milliseconds}); }
 });
 vm.runInContext(fs.readFileSync(staticDir + '/calendar-monitor.js', 'utf8'), context);
 const status = {enabled: true, setup_done: true, message: '仍有列待核對', partial: false,
@@ -44,6 +51,8 @@ vm.runInContext('paint(status)', context);
 assert.equal(ids.get('source-observation').textContent, '尚未建立刀表觀察基準。');
 assert.equal(ids.get('source-changes').children.length, 0);
 assert.equal(ids.get('source-observation-error').hidden, true);
+assert.equal(ids.get('sheets-usage').textContent, '尚未使用');
+assert.equal(ids.get('calendar-usage').textContent, '尚未使用');
 assert.match(ids.get('source-frequency').textContent, /5 分鐘（300 秒）/);
 assert.match(ids.get('source-frequency').textContent, /日曆每 60 分鐘同步/);
 assert.match(ids.get('source-frequency').textContent, /不是即時或每次編輯觸發/);
@@ -102,18 +111,72 @@ assert(!rendered.join(' ').includes('[object Object]'));
 assert.match(ids.get('state').textContent, /^同步受阻/,
   'A recorded source change is not a confirmed Calendar update');
 (async () => {
-  context.fetch = async () => ({ok: true, json: async () => status});
-  await vm.runInContext('refresh()', context);
+  context.fetch = async (path, options) => {
+    requests.push({path, options});
+    return {ok: true, json: async () => status};
+  };
+  resolveInitialFetch({ok: true, json: async () => status});
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(timers.length, 1);
+  assert.equal(timers[0].milliseconds, 5000);
   assert.equal(ids.get('source-changes').children.length, 4);
+
+  // A quota rejection is a global failure even with a recent successful sync.
+  status.failure_code = 'usage_budget';
+  status.message = '本機 Google API 用量已達最近 24 小時上限，暫停送出要求；稍後會重新核對。';
+  status.consecutive_failures = 2;
+  status.last_success = '2026-11-10T19:00:00+08:00';
+  status.health.last_success_age_seconds = 60;
+  status.api_usage = {
+    sheets: {day_calls: 10000, day_units: 10000, day_limit: 10000,
+      minute_calls: 45, minute_units: 45, minute_limit: 45},
+    calendar: {day_calls: 3, day_units: 9, day_limit: 10000,
+      minute_calls: 3, minute_units: 9, minute_limit: 120}
+  };
+  status.history = [{ok: false, failure_code: 'usage_budget', partial: false,
+    message: status.message, updated: 0, deleted: 0}];
+  await timers[0].callback();
+  assert.match(ids.get('state').textContent, /^同步受阻/);
+  assert(ids.get('state').classList.contains('blocked'));
+  assert(ids.get('state').textContent.includes(status.message));
+  assert.match(ids.get('success').textContent, /19:00:00.*距今 1 分鐘/);
+  assert.match(ids.get('counts').textContent, /本輪未完成/);
+  assert(!ids.get('counts').textContent.includes('需核對 0'));
+  assert.equal(ids.get('failures').textContent, '2');
+  assert.equal(ids.get('sheets-usage').textContent,
+    '10000 次請求 · 10000 / 10000 單位（最近一分鐘 45 / 45）');
+  assert.equal(ids.get('calendar-usage').textContent,
+    '3 次請求 · 9 / 10000 單位（最近一分鐘 9 / 120）',
+    'Calendar PATCH cost is shown as units separately from HTTP attempt count');
+  assert.match(ids.get('history').children[0].textContent, /^未完成/);
+  assert.equal(ids.get('source-changes').children.length, 4);
+
+  // After the rolling window frees capacity, a confirmed sync clears the banner.
   status.health.state = 'ready';
   status.failure_code = '';
   status.consecutive_failures = 0;
+  status.message = '同步完成：更新 1 筆，刪除 0 筆。';
+  status.updated = 1;
   status.last_success = '2026-11-10T19:01:00+08:00';
   status.health.last_success_age_seconds = 0;
-  await vm.runInContext('refresh()', context);
+  status.api_usage.sheets = {...status.api_usage.sheets,
+    day_calls: 10, day_units: 10, minute_calls: 5, minute_units: 5};
+  status.api_usage.calendar = {...status.api_usage.calendar,
+    day_calls: 4, day_units: 6, minute_calls: 1, minute_units: 3};
+  await timers[0].callback();
   assert.match(ids.get('state').textContent, /^同步正常/);
+  assert(!ids.get('state').classList.contains('blocked'));
+  assert.equal(ids.get('failures').textContent, '0');
+  assert.equal(ids.get('calendar-usage').textContent,
+    '4 次請求 · 6 / 10000 單位（最近一分鐘 3 / 120）');
+  assert.match(ids.get('counts').textContent, /更新 1/);
+  assert(!ids.get('counts').textContent.includes('本輪未完成'));
   assert.equal(ids.get('source-changes').children.length, 4,
     'Source observation history survives Calendar recovery');
+  assert(requests.length >= 3);
+  assert(requests.every(({path, options}) => path === '/api/status'
+    && (!options.method || options.method === 'GET') && options.body === undefined),
+    'Startup and periodic refresh read local status without invoking check/run/cloud actions');
   status.source_observation_error = '刀表觀察暫未完成；稍後重試。';
   status.hours = 2;
   vm.runInContext('paint(status)', context);

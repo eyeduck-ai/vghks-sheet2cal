@@ -75,7 +75,9 @@ class SheetsClient:
             if method == "POST":
                 raise SheetUncertain("Google 尚未確認寫入結果，請先核對更新結果。", code="transient", retryable=True)
             raise SheetUnavailable("Google 暫時無法完成請求；待處理操作保留，稍後可重新連線。", code="transient", retryable=True)
-        if not response.ok:
+        if not response.ok or 300 <= response.status_code < 400:
+            if response.status_code == 400 and suffix == "/values:batchUpdateByDataFilter":
+                raise SheetError("事件綁定目標在寫入時已變動；重新核對相關列。", code="binding_changed", retryable=True)
             raise SheetError("Google 拒絕此更新；請重新讀取刀表、檢查欄位或保護範圍。")
         try:
             return response.json()
@@ -93,6 +95,17 @@ class SheetsClient:
 
     def read_metadata(self):
         return self.request("GET", params={"fields": "developerMetadata"})
+
+    def search_developer_metadata(self, key):
+        result = self.request("POST", "/developerMetadata:search", json={"dataFilters": [
+            {"developerMetadataLookup": {"metadataKey": key, "visibility": "DOCUMENT"}}]})
+        return [item["developerMetadata"] for item in result.get("matchedDeveloperMetadata", [])]
+
+    def write_filtered_values(self, body):
+        from .sheet_archive_lock import assert_archive_available
+
+        assert_archive_available(self.read_metadata(), getattr(self, "archive_owner", ""))
+        return self.request("POST", "/values:batchUpdateByDataFilter", json=body)
 
     def read(self):
         return self._read(managed=False)

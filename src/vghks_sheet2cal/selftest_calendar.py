@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 import tempfile
 import threading
 from datetime import date
@@ -58,6 +59,35 @@ class MemorySheets:
         with self.lock:
             return {"developerMetadata": copy.deepcopy(self.book.get("developerMetadata", []))}
 
+    def search_developer_metadata(self, key):
+        with self.lock:
+            return [copy.deepcopy(item) for item in self.book.get("developerMetadata", [])
+                    if item.get("metadataKey") == key and item.get("visibility") == "DOCUMENT"]
+
+    @staticmethod
+    def _metadata_matches(item, lookup):
+        return all((item.get("location", {}).get("locationType") if key == "locationType" else item.get(key)) == value
+                   for key, value in lookup.items())
+
+    def write_filtered_values(self, body):
+        with self.lock:
+            count = 0
+            for value_range in body["data"]:
+                lookup = value_range["dataFilter"]["developerMetadataLookup"]
+                for metadata in self.book.get("developerMetadata", []):
+                    if not self._metadata_matches(metadata, lookup):
+                        continue
+                    bounds = metadata["location"]["dimensionRange"]
+                    row = bounds["startIndex"]
+                    for col, value in enumerate(value_range["values"][0]):
+                        if value is None:
+                            continue
+                        self._write([{"updateCells": {"range": {"sheetId": bounds["sheetId"],
+                            "startRowIndex": row, "endRowIndex": row + 1, "startColumnIndex": col,
+                            "endColumnIndex": col + 1}, "rows": [{"values": [cell(value)]}], "fields": "userEnteredValue"}}])
+                        count += 1
+            return {"totalUpdatedCells": count}
+
     def write(self, requests):
         with self.lock:
             return self._write(requests)
@@ -74,10 +104,23 @@ class MemorySheets:
         for request in requests:
             kind, body = next(iter(request.items()))
             if kind == "createDeveloperMetadata":
-                self.book["developerMetadata"].append({"metadataId": 1, **body["developerMetadata"]})
+                new = copy.deepcopy(body["developerMetadata"])
+                available = 1
+                while available in ids:
+                    available += 1
+                new.setdefault("metadataId", available)
+                ids.add(new["metadataId"])
+                if new.get("location", {}).get("dimensionRange", {}).get("dimension") == "ROWS":
+                    new["location"]["locationType"] = "ROW"
+                self.book["developerMetadata"].append(new)
                 continue
             if kind == "updateDeveloperMetadata":
                 self.book["developerMetadata"][0].update(body["developerMetadata"])
+                continue
+            if kind == "deleteDeveloperMetadata":
+                lookup = body["dataFilter"]["developerMetadataLookup"]
+                self.book["developerMetadata"] = [item for item in self.book["developerMetadata"]
+                                                  if not self._metadata_matches(item, lookup)]
                 continue
             target = body.get("range", body)
             if kind == "addProtectedRange":
@@ -93,6 +136,25 @@ class MemorySheets:
                         while len(sheet["rows"][index]) <= col:
                             sheet["rows"][index].append({})
                         sheet["rows"][index][col].update(copy.deepcopy(entered))
+            elif kind in {"repeatCell", "findReplace"}:
+                for index in range(target["startRowIndex"], target["endRowIndex"]):
+                    while len(sheet["rows"]) <= index:
+                        sheet["rows"].append([])
+                    for col in range(target["startColumnIndex"], target["endColumnIndex"]):
+                        while len(sheet["rows"][index]) <= col:
+                            sheet["rows"][index].append({})
+                        current = sheet["rows"][index][col]
+                        if kind == "repeatCell":
+                            assert body["fields"] == "userEnteredFormat.numberFormat"
+                            current.setdefault("userEnteredFormat", {})["numberFormat"] = copy.deepcopy(
+                                body["cell"]["userEnteredFormat"]["numberFormat"])
+                        elif "formulaValue" not in current.get("userEnteredValue", {}):
+                            value = current.get("userEnteredValue", {}).get("stringValue", "")
+                            if re.fullmatch(body["find"], value):
+                                replacement = re.sub(r"\\(.)", r"\1", body["replacement"])
+                                current["userEnteredValue"] = {"stringValue": replacement}
+                                current.pop("effectiveValue", None)
+                                current.pop("formattedValue", None)
             elif kind == "appendDimension":
                 sheet["properties"]["gridProperties"]["columnCount"] += body["length"]
             elif kind == "updateDimensionProperties":

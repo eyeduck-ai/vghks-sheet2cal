@@ -52,7 +52,7 @@ class CalendarClient:
         if response.status_code == 429 or response.status_code >= 500:
             error = CalendarUncertain if method != "GET" else CalendarError
             raise error("Google 日曆暫時無法完成請求；稍後會核對並重試。", code="transient", retryable=True)
-        if not response.ok:
+        if not response.ok or 300 <= response.status_code < 400:
             raise CalendarError("Google 日曆拒絕這筆事件資料；原綁定保留，請核對日期與內容。",
                                 code="row_rejected" if response.status_code in {400, 422} else "rejected")
         if response.status_code == 204:
