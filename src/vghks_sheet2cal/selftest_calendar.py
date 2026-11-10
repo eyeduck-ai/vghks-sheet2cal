@@ -8,7 +8,7 @@ import threading
 from datetime import date
 from pathlib import Path
 
-from .calendar_client import CalendarUncertain
+from .calendar_client import CalendarError, CalendarUncertain
 from .calendar_monitor import CalendarMonitor
 from .calendar_sync import scan
 from .google_sheets import SheetError
@@ -129,12 +129,18 @@ class MemoryCalendar:
             raise CalendarUncertain("synthetic uncertain insert")
         return self.get(eid)
 
-    def update(self, eid, body):
+    def update(self, eid, body, *, etag=None):
+        if etag and self.events[eid].get("etag") != etag:
+            raise CalendarError("Synthetic event version changed", code="event_changed", retryable=True)
         self.updates += 1
         self.events[eid].update(copy.deepcopy(body))
+        if etag:
+            self.events[eid]["etag"] = f'"synthetic-{self.updates}"'
         return self.get(eid)
 
-    def delete(self, eid):
+    def delete(self, eid, *, etag=None):
+        if etag and self.events.get(eid, {}).get("etag") != etag:
+            raise CalendarError("Synthetic event version changed", code="event_changed", retryable=True)
         self.deletes += 1
         self.events.pop(eid, None)
 

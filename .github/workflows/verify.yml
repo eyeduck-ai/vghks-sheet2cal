@@ -36,7 +36,7 @@ jobs:
           from pathlib import Path
           config = json.loads(Path('compatibility.json').read_text())
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
-              for key in ('gas_revision', 'bot_revision'):
+              for key in ('gas_revision', 'bot_revision', 'policy_revision'):
                   value = config[key]
                   assert re.fullmatch('[0-9a-f]{40}', value)
                   output.write(key + '=' + value + '\n')
@@ -48,6 +48,13 @@ jobs:
           path: .compat/gas
           persist-credentials: false
       - run: python -m vghks_sheet_core.verify --gas-repo .compat/gas
+      - uses: actions/checkout@v6
+        with:
+          repository: eyeduck-ai/op_spreadsheet
+          ref: ${{ steps.compatible.outputs.policy_revision }}
+          path: .compat/policy
+          persist-credentials: false
+      - run: python scripts/verify_monitor_policy.py --policy-repo .compat/policy
       - uses: actions/checkout@v6
         with:
           repository: eyeduck-ai/vghks-bot

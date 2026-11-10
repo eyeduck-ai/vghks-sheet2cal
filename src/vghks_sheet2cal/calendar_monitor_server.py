@@ -11,11 +11,12 @@ from vghks_sheet_core.contract import CONTRACT_VERSION
 
 from .calendar_client import CalendarError
 from .google_sheets import SheetError
+from .monitor_policy import POLICY_VERSION
 from .settings import TAIPEI
 
 STATIC = Path(__file__).with_name("static")
 SAFE_FAILURE_CODES = frozenset({
-    "archive_in_progress", "archive_lock_conflict", "conflict", "host_conflict", "paused", "permission",
+    "archive_in_progress", "archive_lock_conflict", "conflict", "event_changed", "host_conflict", "paused", "permission",
     "rate_limit", "rejected", "response", "row_conflict", "row_issues", "row_rejected", "storage",
     "transient", "transport", "uncertain",
 })
@@ -44,7 +45,7 @@ def health(application):
             "partial": partial, "failed_rows": application.status.get("failed_rows", 0),
             "last_success": last, "last_success_age_seconds": round(age) if age is not None else None,
             "success_max_age_seconds": max_age, "stale": stale, "failure_code": failure_code,
-            "consecutive_failures": failures, "contract_version": CONTRACT_VERSION}
+            "consecutive_failures": failures, "contract_version": CONTRACT_VERSION, "monitor_policy_version": POLICY_VERSION}
 
 
 class MonitorServer(ThreadingHTTPServer):

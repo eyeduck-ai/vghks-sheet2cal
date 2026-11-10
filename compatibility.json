@@ -3,5 +3,7 @@
   "gas_repository": "eyeduck-ai/op_spreadsheet",
   "gas_revision": "3e4babe8bbb799d103372732bd2e45bc1405fb83",
   "bot_repository": "eyeduck-ai/vghks-bot",
-  "bot_revision": "ffe84a6c420ca042ce87469bca444cb57538d112"
+  "bot_revision": "ffe84a6c420ca042ce87469bca444cb57538d112",
+  "policy_version": "1.4.0",
+  "policy_revision": "7125bb5c3456a3978a6c2b66f2991cf68ec13bc5"
 }

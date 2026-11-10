@@ -41,6 +41,9 @@ class CalendarClient:
             return None
         if response.status_code == 409:
             return {"conflict": True}
+        if response.status_code == 412:
+            raise CalendarError("日曆事件在核對後又有變動；保留原事件，下輪重新讀取核對。",
+                                code="event_changed", retryable=True)
         kind = response_kind(response)
         if kind == "rate_limit":
             raise CalendarError("Google 日曆流量限制，已暫停本輪；稍後會重新核對並重試。", code=kind, retryable=True)
@@ -82,7 +85,7 @@ class CalendarClient:
             return self.get(event_id)
         return result
 
-    def update(self, event_id, resource):
+    def update(self, event_id, resource, *, etag=None):
         # PATCH preserves unrelated Calendar fields such as reminders and attachments.
         # Nested fields also retain omitted values. Explicitly clear the other
         # time representation when converting an all-day event to/from timed.
@@ -93,8 +96,10 @@ class CalendarClient:
                 payload[field] = {**when, "date": None}
             elif "date" in when:
                 payload[field] = {**when, "dateTime": None, "timeZone": None}
+        options = {"headers": {"If-Match": etag}} if etag else {}
         return self.request("PATCH", "/events/" + quote(event_id, safe=""), json=payload,
-                            params={"sendUpdates": "none"})
+                            params={"sendUpdates": "none"}, **options)
 
-    def delete(self, event_id):
-        return self.request("DELETE", "/events/" + quote(event_id, safe=""), params={"sendUpdates": "none"})
+    def delete(self, event_id, *, etag=None):
+        options = {"headers": {"If-Match": etag}} if etag else {}
+        return self.request("DELETE", "/events/" + quote(event_id, safe=""), params={"sendUpdates": "none"}, **options)
