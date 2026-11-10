@@ -40,12 +40,24 @@ class GoogleHTTP:
         self.session, self.attempts = session, attempts
         self.sleep, self.jitter = sleep, jitter
         self.requests = self.retries = 0
+        self.quota_units = self.read_requests = self.write_requests = 0
         self.checkpoint = lambda: None
+        self.before_attempt = lambda _method, _url: None
 
     def request(self, method, url, **kwargs):
+        # Redirects are additional requests that would otherwise bypass the
+        # reservation hook. Fixed Google REST endpoints must fail closed on 3xx.
+        kwargs["allow_redirects"] = False
         for attempt in range(self.attempts):
             self.checkpoint()
+            # Reserve before every attempt, including rejected calls and retries.
+            # The production monitor supplies one durable project-scoped guard.
+            self.before_attempt(method, url)
             self.requests += 1
+            self.quota_units += 3 if method == "PATCH" and "/calendar/v3/" in url else 1
+            readonly = method == "GET" or method == "POST" and url.endswith("/developerMetadata:search")
+            self.read_requests += readonly
+            self.write_requests += not readonly
             try:
                 response = self.session.request(method, url, timeout=(10, 55), **kwargs)
             except (requests.RequestException, TransportError):

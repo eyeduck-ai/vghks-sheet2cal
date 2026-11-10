@@ -166,3 +166,122 @@ class ObservationLoopTests(unittest.TestCase):
                 self.assertEqual(monitor.public()["source_changes"], saved_changes)
             finally:
                 monitor.close()
+
+    def test_observation_metrics_and_repeated_status_reads_do_not_call_calendar(self):
+        from types import SimpleNamespace
+
+        from vghks_sheet2cal.calendar_monitor_server import MonitorHandler
+
+        with tempfile.TemporaryDirectory() as directory:
+            monitor, sheets, calendar = self.enabled(directory)
+            try:
+                counters = {name: 0 for name in (
+                    "requests", "retries", "quota_units", "read_requests", "write_requests")}
+                sheets.http = SimpleNamespace(**counters)
+                calendar.http = SimpleNamespace(**counters)
+                original_read = sheets.read_all
+
+                def counted_read():
+                    # Model the five physical reads of the source observation.
+                    sheets.http.requests += 5
+                    sheets.http.quota_units += 5
+                    sheets.http.read_requests += 5
+                    return original_read()
+
+                before_config = monitor.store.get("config", "settings")
+                with ExitStack() as stack:
+                    spies = self.assert_calendar_not_called(stack, calendar)
+                    read = stack.enter_context(patch.object(sheets, "read_all", side_effect=counted_read))
+                    write = stack.enter_context(patch.object(sheets, "write", wraps=sheets.write))
+                    self.assertTrue(monitor.observe_once()["ok"])
+                read.assert_called_once()
+                write.assert_not_called()
+                for spy in spies:
+                    spy.assert_not_called()
+                expected = {
+                    "sheets": {**counters, "requests": 5, "quota_units": 5, "read_requests": 5},
+                    "calendar": counters,
+                }
+                self.assertEqual(monitor.public()["source_observation_api"], expected)
+                self.assertEqual(monitor.store.get("config", "settings"), before_config)
+
+                # The browser's periodic GET uses this real handler. Repainting
+                # local status must not open clients or re-read either service.
+                replies = []
+                handler = SimpleNamespace(
+                    path="/api/status", server=SimpleNamespace(application=monitor),
+                    local_request=lambda: True, authorized=lambda: True,
+                    reply=lambda status, payload: replies.append((status, payload)),
+                )
+                with patch.object(monitor, "clients", side_effect=AssertionError("Status opened cloud clients")), \
+                        patch.object(sheets, "read_all", side_effect=AssertionError("Status read cloud source")):
+                    for _ in range(3):
+                        MonitorHandler.do_GET(handler)
+                self.assertEqual(len(replies), 3)
+                for status, payload in replies:
+                    self.assertEqual(status, 200)
+                    self.assertEqual(payload["source_observation_api"], expected)
+                self.assertEqual(monitor.store.get("config", "settings"), before_config)
+            finally:
+                monitor.close()
+
+    def test_pausing_during_minute_budget_wait_stops_observation_without_calendar_failure(self):
+        from unittest.mock import Mock
+
+        from vghks_sheet2cal.api_usage import ApiUsageGuard
+        from vghks_sheet2cal.google_http import GoogleHTTP
+
+        with tempfile.TemporaryDirectory() as directory:
+            monitor, sheets, calendar = self.enabled(directory)
+            try:
+                config = monitor.store.get("config", "settings")
+                config["consecutive_failures"] = 9
+                monitor.store.save("config", "settings", config)
+                monitor._status(failure_code="conflict", partial=False, updated=2, deleted=0)
+                previous = {key: monitor.public().get(key) for key in (
+                    "failure_code", "partial", "updated", "deleted", "last_success", "next_check",
+                    "consecutive_failures")}
+                previous_revision = monitor.journal.latest()["revision"]
+                waits = []
+
+                def pause_while_waiting(seconds):
+                    self.assertGreater(seconds, 0)
+                    self.assertLessEqual(seconds, 1)
+                    waits.append(seconds)
+                    monitor.pause()
+
+                guard = ApiUsageGuard(monitor.store, "synthetic-project", clock=lambda: 1000,
+                                      sleep=pause_while_waiting, minute_limits={"sheets": 1})
+                guard.reserve("sheets", "GET")
+                monitor.api_usage = guard
+                session = Mock()
+                sheets.http = GoogleHTTP(session)
+                calendar.http = GoogleHTTP(Mock())
+                sheets.http.before_attempt = lambda method, url: guard.before_attempt(
+                    method, url, checkpoint=sheets.http.checkpoint)
+
+                def read_waiting_for_budget():
+                    sheets.http.request("GET", "https://sheets.googleapis.com/v4/spreadsheets/synthetic")
+                    self.fail("An interrupted observation reached the source read")
+
+                with ExitStack() as stack:
+                    spies = self.assert_calendar_not_called(stack, calendar)
+                    stack.enter_context(patch.object(sheets, "read_all", side_effect=read_waiting_for_budget))
+                    result = monitor.observe_once()
+                self.assertEqual(result, {"ok": False, "paused": True})
+                self.assertEqual(len(waits), 1)
+                session.request.assert_not_called()
+                state = monitor.public()
+                self.assertFalse(state["enabled"])
+                self.assertEqual({key: state.get(key) for key in previous}, previous)
+                self.assertFalse(state.get("source_observation_error"))
+                self.assertEqual(monitor.journal.latest()["revision"], previous_revision)
+                self.assertEqual(guard.snapshot()["sheets"]["day_calls"], 1,
+                                 "A paused waiter consumes no new HTTP reservation")
+                self.assertEqual(state["source_observation_api"]["sheets"]["requests"], 0)
+                self.assertEqual(state["source_observation_api"]["calendar"]["requests"], 0)
+                for spy in spies:
+                    spy.assert_not_called()
+                self.assertFalse(monitor.busy.locked())
+            finally:
+                monitor.close()

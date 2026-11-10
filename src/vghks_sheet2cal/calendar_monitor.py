@@ -18,6 +18,8 @@ from vghks_sheet_core.cells import fingerprint
 from vghks_sheet_core.common import norm
 
 from . import __version__
+from .api_usage import ApiUsageGuard
+from .binding_writes import cleanup_binding_anchors, marker_key, plan_binding_anchors, resolve_binding_anchors
 from .calendar_client import CalendarClient, CalendarError
 from .calendar_sync import (
     OWNER_KEY,
@@ -33,6 +35,7 @@ from .calendar_sync import (
     schedule_in_calendar_range,
     schedule_requires_reconciliation,
 )
+from .google_http import GoogleServiceError
 from .google_sheets import GoogleSettings, SheetError, SheetsClient, spreadsheet_id
 from .host_registration import current_host_id
 from .locking import lock_file
@@ -41,6 +44,7 @@ from .portable_credentials import seal, unseal
 from .settings import TAIPEI, timestamp
 from .source_journal import SourceJournal
 from .source_validation import project_source
+from .technical_writes import guard_technical_writes
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/calendar.events"]
 
@@ -153,6 +157,11 @@ class CalendarMonitor:
         self.today = today or (lambda: datetime.now(TAIPEI).date())
         self.store = MonitorStore(directory)
         self.journal = SourceJournal(self.store)
+        self.api_usage = None
+        self.usage_project = ""
+        raw_key = self.store.key()
+        if raw_key:
+            self._usage_guard(raw_key)
         self.next_observation = 0.0
         self.clients_factory = clients
         self.stop = threading.Event()
@@ -178,6 +187,7 @@ class CalendarMonitor:
                     "worker_alive": self.thread.is_alive(), "platform": sys.platform, "history": self.store.recent("history"),
                     "source_observation": self.status.get("source_observation", {}),
                     "source_changes": self.journal.recent(20), "observation_interval_seconds": OBSERVATION_SECONDS,
+                    "api_usage": self.api_usage.snapshot() if self.api_usage else {},
                     "monitor_version": __version__, "monitor_policy_version": POLICY_VERSION}
 
     def configure(self, values):
@@ -206,6 +216,7 @@ class CalendarMonitor:
                 raise ValueError("請先執行「檢查並準備刀表」，完成後再啟用。")
             if values.get("key"):
                 self.store.key(values["key"])
+                self._usage_guard(values["key"])
                 changed["email"] = values["key"]["client_email"]
             changed.pop("autorun", None)
             if changed["enabled"] and not config["enabled"]:
@@ -214,6 +225,15 @@ class CalendarMonitor:
             return self.public()
         finally:
             self.busy.release()
+
+    def _usage_guard(self, raw):
+        domain = raw["client_email"].split("@", 1)[-1]
+        suffix = ".iam.gserviceaccount.com"
+        project = domain[:-len(suffix)] if domain.endswith(suffix) else raw.get("project_id") or domain
+        if not self.api_usage or self.usage_project != project:
+            self.api_usage = ApiUsageGuard(self.store, project)
+            self.usage_project = project
+        return self.api_usage
 
     @contextmanager
     def clients(self):
@@ -225,8 +245,20 @@ class CalendarMonitor:
         if not raw:
             raise ValueError("請先匯入服務帳戶金鑰。")
         credentials = service_account.Credentials.from_service_account_info(raw, scopes=SCOPES)
-        sheets = SheetsClient(config["spreadsheet_id"], AuthorizedSession(credentials))
-        calendar = CalendarClient(config["calendar_id"], AuthorizedSession(credentials))
+        guard = self._usage_guard(raw)
+        # Token refresh before a request is automatic. Do not let an internal
+        # 401 replay bypass durable per-attempt accounting or mutation recovery.
+        sheets = SheetsClient(config["spreadsheet_id"], AuthorizedSession(credentials, max_refresh_attempts=0))
+        calendar = CalendarClient(config["calendar_id"], AuthorizedSession(credentials, max_refresh_attempts=0))
+        def stop_checkpoint():
+            if self.stop.is_set():
+                raise CalendarError("監控正在停止，待核對狀態已保留。", code="paused", retryable=True)
+
+        for client in (sheets, calendar):
+            transport = client.http
+            transport.checkpoint = stop_checkpoint
+            transport.before_attempt = lambda method, url, http=transport: guard.before_attempt(
+                method, url, checkpoint=http.checkpoint)
         try:
             yield sheets, calendar
         finally:
@@ -298,7 +330,7 @@ class CalendarMonitor:
         if fingerprint(fresh) != fingerprint(book):
             raise ValueError("刀表在準備期間有變動，請重新執行；未寫入。")
         self._assert_owner(sheets)
-        sheets.write(requests_)
+        sheets.write(guard_technical_writes(book, requests_))
         result = self._read_monitor(sheets)
         actual = self._scan_source(result)
         if actual["issues"]:
@@ -501,17 +533,23 @@ class CalendarMonitor:
         return reader()
 
     def _write_bindings(self, sheets, bindings):
-        # Relocate stable IDs before each bounded batch. A changed row must not
-        # prevent other verified bindings from reaching durable ready state.
+        # Short-lived native row anchors follow whole-row moves. Conditions on
+        # the old address alone cannot distinguish two blank event-ID cells.
         succeeded, issues = set(), []
+        worker_id = self.store.get("config", "settings")["worker_id"]
+        pending = (self.store.get("binding", "anchors_pending") or {}).get("pending")
+        if not bindings and not pending:
+            return succeeded, issues
+        self._cleanup_binding_anchors(sheets, worker_id)
         for start in range(0, len(bindings), 100):
             self._checkpoint()
             batch = bindings[start:start + 100]
-            current = self._scan_source(self._read_monitor(sheets))
+            current_book = self._read_monitor(sheets)
+            current = self._scan_source(current_book)
             if current["issues"]:
                 raise ValueError("回寫事件 ID 前刀表有衝突，事件已保存在監控紀錄，稍後重試。")
             indexed = {p["uid"]: p for p in current["patients"]}
-            requests_, valid = [], []
+            valid = []
             for item, eid in batch:
                 target = indexed.get(item["uid"])
                 if not target or target["identity"] != item["identity"]:
@@ -521,15 +559,52 @@ class CalendarMonitor:
                     issues.append(row_issue(target, "既有事件 ID 已由其他操作變更，未覆寫。"))
                     continue
                 valid.append((item, eid))
-                if target["event_id"] == eid:
-                    continue
-                col = target["cols"]["CalendarEventId"]
-                requests_.append({"updateCells": {"range": {"sheetId": target["sheet_id"], "startRowIndex": target["row"],
-                    "endRowIndex": target["row"] + 1, "startColumnIndex": col, "endColumnIndex": col + 1},
-                    "rows": [{"values": [{"userEnteredValue": {"stringValue": eid}}]}], "fields": "userEnteredValue"}})
-            if requests_:
+            needs_write = [(indexed[item["uid"]], eid) for item, eid in valid if indexed[item["uid"]]["event_id"] != eid]
+            if needs_write:
+                plan = plan_binding_anchors(needs_write, worker_id)
+                # A crash or ambiguous create/cleanup must be recoverable even
+                # when the next cycle has no event IDs left to write.
+                self.store.save("binding", "anchors_pending", {"pending": True})
                 self._assert_owner(sheets)
-                sheets.write(requests_)
+                sheets.write(plan["requests"])
+                markers = sheets.search_developer_metadata(plan["key"])
+                anchored_book = self._read_monitor(sheets)
+                anchored = self._scan_source(anchored_book)
+                if anchored["issues"]:
+                    raise ValueError("事件綁定前刀表結構有變動，保留事件並待下輪核對。")
+                resolved = resolve_binding_anchors(plan, anchored_book, anchored["patients"], markers)
+                issues.extend(resolved["row_issues"])
+                deferred = {issue["uid"] for issue in resolved["row_issues"]}
+                valid = [(item, eid) for item, eid in valid if item["uid"] not in deferred]
+                if resolved["body"]["data"]:
+                    self._assert_owner(sheets)
+                    try:
+                        sheets.write_filtered_values(resolved["body"])
+                    except SheetError as exc:
+                        if exc.code != "binding_changed":
+                            raise
+                        # A row may be deleted, taking its metadata with it.
+                        # Re-resolve and isolate definite per-filter rejections;
+                        # network/5xx/permission failures are never replayed here.
+                        latest_markers = sheets.search_developer_metadata(plan["key"])
+                        latest_book = self._read_monitor(sheets)
+                        latest = self._scan_source(latest_book)
+                        if latest["issues"]:
+                            raise ValueError("事件綁定核對時刀表結構有變動；原事件保留。") from exc
+                        retried = resolve_binding_anchors(plan, latest_book, latest["patients"], latest_markers)
+                        issues.extend(retried["row_issues"])
+                        for value_range in retried["body"]["data"]:
+                            self._assert_owner(sheets)
+                            try:
+                                sheets.write_filtered_values({**retried["body"], "data": [value_range]})
+                            except SheetError as failed:
+                                if failed.code != "binding_changed":
+                                    raise
+                                uid = value_range["dataFilter"]["developerMetadataLookup"]["metadataValue"].split(":")[1]
+                                item = next(item for item, _ in valid if item["uid"] == uid)
+                                issues.append(row_issue(item, "此列的事件綁定尚未確認；其他正常列繼續。", "binding_anchor"))
+                        deferred = {issue["uid"] for issue in issues}
+                        valid = [(item, eid) for item, eid in valid if item["uid"] not in deferred]
             verified = self._scan_source(self._read_monitor(sheets))
             if verified["issues"]:
                 raise ValueError("事件 ID 回讀發現刀表結構衝突；監控已保留事件綁定。")
@@ -540,7 +615,17 @@ class CalendarMonitor:
                     issues.append(row_issue(target or item, "事件 ID 回讀不一致；監控已保留事件綁定。"))
                 else:
                     succeeded.add(item["uid"])
+            if needs_write:
+                self._cleanup_binding_anchors(sheets, worker_id)
         return succeeded, issues
+
+    def _cleanup_binding_anchors(self, sheets, worker_id):
+        markers = sheets.search_developer_metadata(marker_key(worker_id))
+        requests_ = cleanup_binding_anchors(worker_id, markers)
+        if requests_:
+            self._assert_owner(sheets)
+            sheets.write(requests_)
+        self.store.save("binding", "anchors_pending", {"pending": False})
 
     def _sync_item(self, sheets, calendar, item, config, now):
         old = self.store.get("event", item["uid"])
@@ -842,7 +927,7 @@ class CalendarMonitor:
             self.last_scan_ok = not row_issues
         except Exception as exc:
             self.last_scan_ok = False
-            message = str(exc) if isinstance(exc, (ValueError, CalendarError, SheetError)) else "同步未完成，已保存待核對狀態；請檢查網路與設定。"
+            message = str(exc) if isinstance(exc, (ValueError, GoogleServiceError)) else "同步未完成，已保存待核對狀態；請檢查網路與設定。"
             result = {"ok": False, "at": now, "message": message, "updated": updated, "deleted": deleted,
                       "failure_code": getattr(exc, "code", "") or "conflict", "retryable": bool(getattr(exc, "retryable", False)),
                       "partial": False, "row_issues": row_issues, "failed_rows": len(row_issues)}
@@ -857,8 +942,7 @@ class CalendarMonitor:
             self._reset_missing()
         finally:
             try:
-                metrics = {label: {"requests": client.http.requests, "retries": client.http.retries}
-                           for label, client in (("sheets", sheets), ("calendar", calendar)) if hasattr(client, "http")}
+                metrics = self._api_metrics(sheets, calendar)
                 # Pause can update settings while this round finishes a request.
                 config = self.store.get("config", "settings")
                 failures = 0 if result["ok"] else config.get("consecutive_failures", 0) + 1
@@ -888,29 +972,51 @@ class CalendarMonitor:
 
     def observe_once(self):
         """Read-only five-minute source observation; never calls Calendar or allocates IDs."""
+        with self.state_lock:
+            epoch = self.pause_epoch
         if not self.busy.acquire(blocking=False):
             return {"ok": False, "busy": True}
+        sheets = calendar = None
+        self.active_epoch = epoch
         try:
             config = self.store.get("config", "settings")
             if not config.get("enabled") or not config.get("setup_done"):
                 return {"ok": False, "paused": True}
-            with self.clients() as (sheets, _calendar):
+            with self.clients() as (sheets, calendar):
+                for client in (sheets, calendar):
+                    if hasattr(client, "http"):
+                        client.http.checkpoint = self._checkpoint
                 book = self._read_monitor(sheets)
                 self._require_owner(book, config)
                 observed = self._observe(book)
+                self._status(source_observation_api=self._api_metrics(sheets, calendar))
             with self.state_lock:
                 self.store.save("health", "last", dict(self.status))
             return {"ok": True, **observed}
-        except Exception:
+        except Exception as exc:
             # Source observation is distinct from the last Calendar cycle. It
             # must not hide an existing sync failure or kill hourly retries.
+            self._status(source_observation_api=self._api_metrics(sheets, calendar))
+            if getattr(exc, "code", "") == "paused":
+                with self.state_lock:
+                    self.store.save("health", "last", dict(self.status))
+                return {"ok": False, "paused": True}
             self.next_observation = time.monotonic() + 60
-            self._status(source_observation_error="刀表觀察暫未完成；稍後重試，日曆同步結果另外顯示。")
+            message = "刀表觀察暫未完成；稍後重試，日曆同步結果另外顯示。"
+            if getattr(exc, "code", "") == "usage_budget":
+                message = "刀表觀察已達本機 API 用量保護上限；保留觀察紀錄，額度釋出後重試。"
+            self._status(source_observation_error=message)
             with self.state_lock:
                 self.store.save("health", "last", dict(self.status))
             return {"ok": False}
         finally:
             self.busy.release()
+
+    @staticmethod
+    def _api_metrics(sheets, calendar):
+        return {label: {name: getattr(client.http, name, 0) for name in (
+            "requests", "retries", "quota_units", "read_requests", "write_requests")}
+                for label, client in (("sheets", sheets), ("calendar", calendar)) if hasattr(client, "http")}
 
     def _loop(self):
         while not self.stop.wait(10):

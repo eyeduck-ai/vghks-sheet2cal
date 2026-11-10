@@ -86,6 +86,10 @@ function paint(data) {
   paintRowIssues(preflightRows ? preflightRows.issues : data.row_issues);
   byId("source-frequency").textContent = `啟用監控時每 5 分鐘（300 秒）觀察刀表；日曆每 ${Number.isInteger(data.hours) && data.hours > 0 ? data.hours * 60 : 60} 分鐘同步。兩者都不是即時或每次編輯觸發。`;
   paintSourceChanges(data.source_observation, data.source_changes, data.source_observation_error);
+  for (const service of ["sheets", "calendar"]) {
+    const usage = data.api_usage?.[service];
+    byId(`${service}-usage`).textContent = usage ? `${usage.day_calls} 次請求 · ${usage.day_units} / ${usage.day_limit} 單位（最近一分鐘 ${usage.minute_units} / ${usage.minute_limit}）` : "尚未使用";
+  }
   byId("run").disabled = working || data.running || !data.setup_done; byId("prepare").disabled = working || data.running;
 }
 async function refresh() { try { paint(await request("/api/status")); } catch (error) { notice(error.message); } }

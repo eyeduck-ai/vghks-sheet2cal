@@ -18,7 +18,7 @@ STATIC = Path(__file__).with_name("static")
 SAFE_FAILURE_CODES = frozenset({
     "archive_in_progress", "archive_lock_conflict", "conflict", "event_changed", "host_conflict", "paused", "permission",
     "rate_limit", "rejected", "response", "row_conflict", "row_issues", "row_rejected", "storage",
-    "transient", "transport", "uncertain",
+    "transient", "transport", "uncertain", "usage_budget",
 })
 
 
