@@ -55,5 +55,7 @@ jobs:
           path: .compat/bot
           persist-credentials: false
       - run: python -m pip install ./.compat/bot
+      - name: Verify main writer to Calendar lifecycle offline
+        run: python scripts/verify_writer_lifecycle.py --bot-repo .compat/bot
       - run: python .compat/gas/tools/verify_consumer.py --bot-repo .compat/bot
       - run: python -m unittest tests.test_contract -v

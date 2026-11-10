@@ -228,23 +228,16 @@ class CalendarMonitor:
         from .sheet_identity import plan_identity_setup
 
         assert_archive_available(book)
-        before = scan(book)
-        missing_old = [e for e in self.store.all("event") if e["uid"] not in before["identities"]
-                       and e.get("status") != "deleted" and not e.get("frozen_past")
-                       and in_calendar_range(e.get("resource"), self.today())]
-        new_without_id = any(not p["uid"] for p in before["patients"]
-                             if not p["date"] or schedule_in_calendar_range(p, self.today()))
-        if missing_old and new_without_id:
-            raise ValueError("同時發現原排程消失與未識別病人列，疑似只搬移可見欄位；請保留原事件並核對 ID。")
+        # A genuinely removed row and an unrelated new row are independent
+        # operations. Allocate new IDs without inferring a match by patient.
+        # Orphaned/duplicated IDs still fail the structural planner below;
+        # missing bound events use the normal two-complete-scan deletion guard.
         plan = plan_identity_setup(book, include_archives=True)
         if plan["issues"]:
             raise ValueError("；".join(i.get("reason") or f"{i.get('sheet', '')} {i['code']}" for i in plan["issues"][:8]))
         expected = scan(plan["book"])
         if expected["issues"]:
             raise ValueError("；".join(expected["issues"][:8]))
-        if missing_old and any(p["uid"] not in before["identities"] for p in expected["patients"]
-                               if not p["date"] or schedule_in_calendar_range(p, self.today())):
-            raise ValueError("舊排程識別消失且有新識別待配置，請核對是否僅搬移可見欄位；未變更刀表或日曆。")
         self._validate_bindings(plan["book"], expected)
         requests_ = plan["requests"]
         if not requests_:

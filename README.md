@@ -18,6 +18,8 @@
 
 刀表仍完整讀取受支援月份、FU／All 與封存的排程 ID，以保護跨月搬列、封存及刪除確認；不依月份名稱略過分頁。缺列且已過去或日期不明的事件保留。
 
+整列刪除後另建無 ID 的新排程，視為兩筆獨立操作：新列建立事件，舊的今天／未來事件經連續兩輪完整成功掃描確認後刪除；過去事件保留。不依姓名推測兩列是同一排程。改期要沿用原事件時，請保留兩個 ID。
+
 ## 安裝與常駐部署
 
 需要 Linux、Git、uv、systemd 使用者服務。從此專案根目錄執行：
@@ -75,7 +77,7 @@ systemctl --user restart vghks-sheet2cal.service
 
 `run-once` 立即排入單輪同步；稍後用 `status` 或狀態頁查看完成結果。`pause` 會持久保存停用設定；systemd 重啟不會自行解除暫停。停止服務時在操作安全邊界保存狀態，重啟後續接既有事件。
 
-`/healthz` 表示服務存活；`/readyz` 只有在已設定、啟用且最近兩個週期內有完整成功同步且目前沒有部分完成問題時回覆 200。無設定時健康狀態為 `setup_required`。日誌省略憑證、入口 token 與病人資料，詳細問題顯示在已驗證的本機狀態頁。
+`/healthz` 表示服務存活；`/readyz` 只有在已設定、啟用、最近兩個週期內有完整成功同步，且目前沒有整輪失敗或部分完成問題時回覆 200。整輪失敗立即標記 `blocked`；狀態頁另顯示最近成功距今時間。無設定時健康狀態為 `setup_required`。日誌省略憑證、入口 token 與病人資料，詳細問題顯示在已驗證的本機狀態頁。
 
 更新程式後再次執行 `bash scripts/deploy.sh`。更新不重建狀態資料庫；備份及搬移請保留完整狀態目錄，並在複製前停止服務。尚未完成的操作不能僅從刀表重建。
 
@@ -91,6 +93,8 @@ systemctl --user restart vghks-sheet2cal.service
 
 主程式與此監控使用同一份 `vghks-sheet-core` 欄位解析、永久識別、共享基準與日曆呈現。GAS 使用生成的欄位定義，並以真實 GAS 匯出案例驗證解析及操作語意。更新步驟見該 repo 的 `docs/SHEET_CONTRACT.md`。
 
+三個產品可各自更新與發布；只有共用欄位、識別或狀態語意改變時才需協調契約更新。`compatibility.json` 的主程式版本是 CI 驗證基準，不是執行時依賴。本版已驗證主程式 6.19.1、GAS 2026.10.27 與共用核心 1.3.0，監控不載入主程式或院內 SDK。
+
 ## 開發驗證
 
 ```bash
@@ -100,7 +104,7 @@ uv run --locked --extra dev python -m unittest discover -s tests -v
 uv run --locked python -m vghks_sheet_core.verify
 ```
 
-測試只使用合成資料與記憶體 Google 用戶端，涵蓋 FU、改期、事件 ID、重啟續接、刪除確認、API 重試、封存互斥、跨程序鎖、loopback 驗證與 SIGTERM 停止。CI 另取得固定 GAS source，執行真實匯出器，核對共用核心及指定主程式版本。
+測試只使用合成資料與記憶體 Google 用戶端，涵蓋 FU、改期、事件 ID、重啟續接、刪除確認、API 重試、封存互斥、跨程序鎖、loopback 驗證與 SIGTERM 停止。CI 另取得固定 GAS source，執行真實匯出器，核對共用核心及指定主程式版本，並以實際主程式寫入器驗證監控的排程生命週期。
 
 `UPSTREAM.json` 記錄拆分來源。主程式 repo 只提供 VGHKS-bot.exe；監控在此 repo 獨立維護、發布及部署。每份刀表只允許一台主機同步。
 

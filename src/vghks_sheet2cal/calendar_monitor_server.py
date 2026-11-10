@@ -14,6 +14,11 @@ from .google_sheets import SheetError
 from .settings import TAIPEI
 
 STATIC = Path(__file__).with_name("static")
+SAFE_FAILURE_CODES = frozenset({
+    "archive_in_progress", "archive_lock_conflict", "conflict", "host_conflict", "paused", "permission",
+    "rate_limit", "rejected", "response", "row_conflict", "row_issues", "row_rejected", "storage",
+    "transient", "transport", "uncertain",
+})
 
 
 def health(application):
@@ -21,19 +26,25 @@ def health(application):
     last = config.get("last_success", "")
     try:
         age = (datetime.now(TAIPEI) - datetime.fromisoformat(last)).total_seconds() if last else None
-    except ValueError:
+    except (TypeError, ValueError):
         age = None
     configured = application.store.configured() and config.get("setup_done", False)
     enabled = config.get("enabled", False)
     alive = application.thread.is_alive()
     partial = bool(application.status.get("partial"))
-    ready = bool(configured and enabled and alive and not partial
-                 and age is not None and age <= config["hours"] * 3600 * 2 + 300)
+    raw_code = application.status.get("failure_code", "")
+    failure_code = raw_code if isinstance(raw_code, str) and raw_code in SAFE_FAILURE_CODES else "unknown" if raw_code else ""
+    failures = config.get("consecutive_failures", 0)
+    blocked = bool(not partial and (failure_code or failures))
+    max_age = config["hours"] * 3600 * 2 + 300
+    stale = age is None or age > max_age
+    ready = bool(configured and enabled and alive and not partial and not blocked and not stale)
     return {"alive": alive, "configured": configured, "enabled": enabled, "ready": ready,
-            "state": "setup_required" if not configured else "paused" if not enabled else "partial" if partial else "ready" if ready else "awaiting_success",
+            "state": "setup_required" if not configured else "paused" if not enabled else "partial" if partial else "blocked" if blocked else "ready" if ready else "awaiting_success",
             "partial": partial, "failed_rows": application.status.get("failed_rows", 0),
             "last_success": last, "last_success_age_seconds": round(age) if age is not None else None,
-            "consecutive_failures": config.get("consecutive_failures", 0), "contract_version": CONTRACT_VERSION}
+            "success_max_age_seconds": max_age, "stale": stale, "failure_code": failure_code,
+            "consecutive_failures": failures, "contract_version": CONTRACT_VERSION}
 
 
 class MonitorServer(ThreadingHTTPServer):
@@ -122,7 +133,7 @@ class MonitorHandler(BaseHTTPRequestHandler):
             self.reply(200, {"instance": self.server.application.store.get("config", "settings")["worker_id"]})
         elif path == "/api/status":
             if self.authorized():
-                self.reply(200, self.server.application.public())
+                self.reply(200, {**self.server.application.public(), "health": health(self.server.application)})
         else:
             self.reply(404, {"error": "找不到此頁面。"})
 
